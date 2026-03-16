@@ -1,0 +1,270 @@
+/**
+ * Token Ring Integration Tests
+ * 
+ * Tests for:
+ * - Token ring formation with real UDP sockets
+ * - Multi-server token passing
+ * - Unresponsive server job reset
+ * 
+ * These tests spin up real TokenRingWorkDistributor instances with real
+ * UDP sockets bound to localhost. They require FDB.
+ */
+
+import { TestTokenRingStorageAdapter } from "./tokenRingAdapter";
+import crypto from "crypto";
+import { test, expect } from "vitest";
+import { TokenRingWorkDistributor } from "../src/tokenRing";
+import { Token, TokenFlags, TokenRingConfig, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
+import { TestingStore } from "./store";
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const createGUID = () => {
+    const id = crypto.randomBytes(16).toString("hex");
+    return id;
+}
+
+/** Minimal token ring config suitable for fast testing */
+function testTokenRingConfig(overrides?: Partial<TokenRingConfig>): TokenRingConfig {
+    return {
+        reregister_time_ms: 60000, // long so re-registration doesn't interfere
+        token_ack_timeout_ms: 500,
+        isDev: true,
+        ...overrides,
+    };
+}
+
+
+/** Create a token ring for testing with an onToken callback that tracks rounds and reports zero workload */
+async function createTestTokenRing(options: {
+    segmentName: string,
+    capabilities: Buffer,
+    config?: Partial<TokenRingConfig>,
+    onToken?: (ctx: { ring: TokenRingWorkDistributorInterface, token: Readonly<Token>, done: (workload: { running: number }) => void, error: (e: any) => void }) => void,
+    onServerUnresponsive?: (reg: { key: any, value: any }) => void | Promise<void>,
+}): Promise<{ tr: TokenRingWorkDistributor, rounds: () => number, lastToken: () => Token | null }> {
+    let roundCount = 0;
+    let lastSeenToken: Token | null = null;
+
+    const defaultHandler = (ctx: { ring: TokenRingWorkDistributorInterface, token: Readonly<Token>, done: (workload: { running: number }) => void, error: (e: any) => void }) => {
+        ctx.done({ running: 0 });
+    }
+    const userHandler = options.onToken ?? defaultHandler;
+
+    const tr = await new TokenRingWorkDistributor({
+        segment_name: options.segmentName,
+        capabilities: options.capabilities,
+        config: testTokenRingConfig(options.config),
+        storage: new TestTokenRingStorageAdapter(),
+        onToken: (ctx) => {
+            roundCount++;
+            lastSeenToken = ctx.token;
+            userHandler(ctx);
+        },
+        onServerUnresponsive: options.onServerUnresponsive,
+        issuer_id: createGUID(),
+    }).Start();
+
+    return {
+        tr,
+        rounds: () => roundCount,
+        lastToken: () => lastSeenToken,
+    };
+}
+
+
+/** Wait for a condition with a timeout */
+async function waitFor(condition: () => boolean, timeoutMs: number, label?: string): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        if (condition()) return;
+        await sleep(50);
+    }
+    throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label || "condition not met"}`);
+}
+
+// =========================================================================
+// Token Ring Formation
+// =========================================================================
+const testPayloadType = 1;
+const testPayloadType2 = 2;
+const testPayloadType3 = 4;
+
+test("tokenRing: single server creates and receives its own token", async () => {
+    const segmentName = `test-single-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+
+    const { tr, rounds } = await createTestTokenRing({ segmentName, capabilities });
+
+    try {
+        await waitFor(() => rounds() >= 1, 5000, "waiting for first token");
+
+        // Token should be issued by this server
+        expect(tr.Token.issued_by).toBe(tr.issuer_id);
+        expect(tr.Token.server_count).toBeGreaterThanOrEqual(0);
+
+        // Capabilities should include our flag
+        expect(tr.Token.capabilities[0]! & testPayloadType).toBe(testPayloadType);
+    } finally {
+        tr.Destroy();
+    }
+});
+
+test("tokenRing: provisional flag cleared when token returns to issuer", async () => {
+    const segmentName = `test-prov-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+
+    const { tr, rounds } = await createTestTokenRing({ segmentName, capabilities });
+
+    try {
+        // Wait for at least 2 rounds — first is provisional, second should have flag cleared
+        await waitFor(() => rounds() >= 2, 5000, "waiting for 2 token rounds");
+
+        // After completing a loop, provisional flag should be cleared
+        expect(tr.Token.flags & TokenFlags.provisional).toBe(0);
+    } finally {
+        tr.Destroy();
+    }
+});
+
+test("tokenRing: two servers pass token between each other", async () => {
+    const segmentName = `test-two-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+    const config: Partial<TokenRingConfig> = { token_ack_timeout_ms: 1000 };
+
+    const { tr: tr1, rounds: tr1Rounds } = await createTestTokenRing({ segmentName, capabilities, config });
+    const { tr: tr2, rounds: tr2Rounds } = await createTestTokenRing({ segmentName, capabilities, config });
+
+    try {
+        // Wait for both to have received at least 1 token 
+        await waitFor(() => tr1Rounds() >= 1 && tr2Rounds() >= 1, 10000, "waiting for both servers to see tokens");
+
+        // After full loop, token should reflect 2 servers
+        // (server_count increments each time the token passes through a server with different version)
+        expect(
+            tr1.Token.server_count >= 1 || tr2.Token.server_count >= 1
+        ).toBe(true);
+
+        // Both should have the capability flag in the token
+        expect(tr1.Token.capabilities[0]! & testPayloadType).toBe(testPayloadType);
+        expect(tr2.Token.capabilities[0]! & testPayloadType).toBe(testPayloadType);
+    } finally {
+        tr1.Destroy();
+        tr2.Destroy();
+    }
+});
+
+
+test("tokenRing: capabilities merge across servers with different caps", async () => {
+    const segmentName = `test-two-${createGUID().slice(0, 8)}`;
+    const config: Partial<TokenRingConfig> = { token_ack_timeout_ms: 1000 };
+
+    const { tr: tr1 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType]), config });
+    const { tr: tr2 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType2]), config });
+
+    try {
+        // Wait until the token has completed a full loop (provisional flag cleared on both servers)
+        await waitFor(() =>
+            (tr1.Token.flags & TokenFlags.provisional) === 0 &&
+            (tr2.Token.flags & TokenFlags.provisional) === 0,
+            10000, "waiting for token to complete a full loop");
+
+        // Both should have both capabilities in their tokens after merging (bitwise OR)
+        expect(tr1.Token.capabilities[0]! & testPayloadType).toBe(testPayloadType);
+        expect(tr1.Token.capabilities[0]! & testPayloadType2).toBe(testPayloadType2);
+        expect(tr2.Token.capabilities[0]! & testPayloadType).toBe(testPayloadType);
+        expect(tr2.Token.capabilities[0]! & testPayloadType2).toBe(testPayloadType2);
+    } finally {
+        tr1.Destroy();
+        tr2.Destroy();
+    }
+});
+
+// =========================================================================
+// Token serialization round-trip
+// =========================================================================
+
+test("tokenRing: token binary format round-trips through serialize/deserialize", async () => {
+    // We can't directly call the private methods, but we can verify the token
+    // data survives a full trip through the ring.
+    const segmentName = `test-serde-${createGUID().slice(0, 8)}`;
+    const caps = Buffer.from([testPayloadType | testPayloadType2 | testPayloadType3]);
+
+    let seenCaps = 0;
+    const { tr, rounds } = await createTestTokenRing({
+        segmentName,
+        capabilities: caps,
+        onToken: (ctx) => {
+            seenCaps = ctx.ring.Token.capabilities[0]!;
+            ctx.done({ running: 0 });
+        },
+    });
+
+    try {
+        await waitFor(() => rounds() >= 2, 5000, "waiting for serde test rounds");
+
+        // After token goes through serialize → UDP → deserialize → merge cycle,
+        // capabilities should still include what we started with
+        expect(seenCaps & testPayloadType).toBe(testPayloadType);
+        expect(seenCaps & testPayloadType2).toBe(testPayloadType2);
+        expect(seenCaps & testPayloadType3).toBe(testPayloadType3);
+    } finally {
+        tr.Destroy();
+    }
+});
+
+// =========================================================================
+// Registration
+// =========================================================================
+
+test("tokenRing: server registers itself in WorkflowRingRegistration table", async () => {
+    const segmentName = `test-reg-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+
+    const { tr } = await createTestTokenRing({ segmentName, capabilities });
+
+    try {
+        // Give it a moment to register
+        await sleep(200);
+
+        // Check the registration table
+        const registrations = await TestingStore.doTransaction(async txn => {
+            return txn.getUsingFilter((v) => v.segment_name === segmentName);
+        });
+
+        expect(registrations.length).toBeGreaterThanOrEqual(1);
+        const [regKey, regValue] = registrations[0]!;
+        expect(regKey.segment_name).toBe(segmentName);
+        expect(regValue.executor_id).toBe(tr.issuer_id);
+    } finally {
+        tr.Destroy();
+
+        // Clean up registrations
+        await TestingStore.doTn(async txn => {
+
+            const regs = txn.getUsingFilter((v) => v.segment_name === segmentName);
+            for (const [k] of regs) {
+                txn.clear(k);
+            }
+        });
+    }
+});
+
+test("tokenRing: destroyed server deregisters from table", async () => {
+    const segmentName = `test-dereg-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+
+    const { tr } = await createTestTokenRing({ segmentName, capabilities });
+
+    // Wait for registration
+    await sleep(200);
+
+    tr.Destroy();
+
+    // Give it a moment to deregister
+    await sleep(500);
+
+    const registrations = await TestingStore.doTn(async txn => {
+        return txn.getUsingFilter((v) => v.segment_name === segmentName);
+    });
+
+    expect(registrations.length).toBe(0);
+});
