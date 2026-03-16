@@ -79,7 +79,7 @@ export interface TokenRingConfig {
     /** How long to wait for an ACK after forwarding the token (ms) */
     token_ack_timeout_ms: number
     /** If true, skip the initial lost-token timeout and suppress the "token timeout" warning on first load */
-    isDev?: boolean
+    skipInitialTokenTimeout?: boolean
     /** If true, enable debug/info logging to console. Errors are always logged. Defaults to false. */
     verbose?: boolean
 }

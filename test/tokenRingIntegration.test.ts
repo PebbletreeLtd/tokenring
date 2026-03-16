@@ -27,7 +27,7 @@ function testTokenRingConfig(overrides?: Partial<TokenRingConfig>): TokenRingCon
     return {
         reregister_time_ms: 60000, // long so re-registration doesn't interfere
         token_ack_timeout_ms: 500,
-        isDev: true,
+        skipInitialTokenTimeout: true,
         ...overrides,
     };
 }
@@ -267,4 +267,92 @@ test("tokenRing: destroyed server deregisters from table", async () => {
     });
 
     expect(registrations.length).toBe(0);
+});
+
+// =========================================================================
+// done() continuation
+// =========================================================================
+
+test("tokenRing: token continues circulating after done() is called", async () => {
+    const segmentName = `test-cont-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+
+    const { tr, rounds } = await createTestTokenRing({ segmentName, capabilities });
+
+    try {
+        // Wait for many rounds — if done() doesn't trigger the next send, it would stall at 1
+        await waitFor(() => rounds() >= 5, 5000, "waiting for 5+ token rounds");
+
+        expect(rounds()).toBeGreaterThanOrEqual(5);
+    } finally {
+        tr.Destroy();
+    }
+});
+
+// =========================================================================
+// Re-registration
+// =========================================================================
+
+test("tokenRing: re-registration refreshes the membership entry", async () => {
+    const segmentName = `test-rereg-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+
+    const { tr } = await createTestTokenRing({
+        segmentName,
+        capabilities,
+        config: { reregister_time_ms: 300 }, // short interval so re-registration fires during the test
+    });
+
+    try {
+        await sleep(200);
+
+        // Capture the initial last_seen timestamp
+        const initial = await TestingStore.doTransaction(async txn => {
+            const regs = txn.getUsingFilter((v) => v.segment_name === segmentName);
+            return regs[0]?.[1]?.last_seen ?? 0;
+        });
+        expect(initial).toBeGreaterThan(0);
+
+        // Wait long enough for at least one re-registration cycle
+        await sleep(600);
+
+        const updated = await TestingStore.doTransaction(async txn => {
+            const regs = txn.getUsingFilter((v) => v.segment_name === segmentName);
+            return regs[0]?.[1]?.last_seen ?? 0;
+        });
+
+        expect(updated).toBeGreaterThan(initial);
+    } finally {
+        tr.Destroy();
+    }
+});
+
+// =========================================================================
+// issuer_id format
+// =========================================================================
+
+test("tokenRing: works with various issuer_id formats", async () => {
+    const segmentName = `test-id-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+
+    // Use a UUID-style id with dashes
+    const uuidStyleId = `${createGUID().slice(0, 8)}-${createGUID().slice(0, 4)}-${createGUID().slice(0, 4)}-${createGUID().slice(0, 12)}`;
+
+    const tr = await new TokenRingWorkDistributor({
+        segment_name: segmentName,
+        capabilities,
+        config: testTokenRingConfig(),
+        storage: new TestTokenRingStorageAdapter(),
+        onToken: (ctx) => { ctx.done({ running: 0 }); },
+        issuer_id: uuidStyleId,
+    }).Start();
+
+    try {
+        await waitFor(() => tr.Token.issued_by === uuidStyleId, 5000, "waiting for token with UUID-style issuer_id");
+
+        expect(tr.Token.issued_by).toBe(uuidStyleId);
+        expect(tr.issuer_id).toBe(uuidStyleId);
+    } finally {
+        tr.Destroy();
+    }
 });

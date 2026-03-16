@@ -17,7 +17,7 @@ function testTokenRingConfig(overrides?: Partial<TokenRingConfig>): TokenRingCon
     return {
         reregister_time_ms: 60000,
         token_ack_timeout_ms: 500,
-        isDev: true,
+        skipInitialTokenTimeout: true,
         verbose: true, // ← add this
         ...overrides,
     };

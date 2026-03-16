@@ -374,13 +374,13 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
     private startLostTokenTimer() {
         if (this.token_timer) clearTimeout(this.token_timer)
         if (this.destroyed) return
-        const timeout = this.options.config.isDev && !this._everLoaded
+        const timeout = this.options.config.skipInitialTokenTimeout && !this._everLoaded
             ? 0
             : Math.max(this.averageLoopDuration * 3, 2000)
         this.log.debug("Waiting for", timeout, " before timing token out")
         this.token_timer = setTimeout(() => {
             if (this.destroyed) return
-            if (!this.options.config.isDev || this._everLoaded)
+            if (!this.options.config.skipInitialTokenTimeout || this._everLoaded)
                 this.log.warn(`Token receive timeout ${this.segmentName}`)
             this._everLoaded = true;
             //issue a new token, force it to be sent, even if the issued by isn't higher
