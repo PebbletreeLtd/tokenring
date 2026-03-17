@@ -1,3 +1,6 @@
+import {
+    MVCCCore
+} from "@pebbletree/mvcc-testing"
 /**
  * Token Ring Abstraction Types
  * 
@@ -45,30 +48,8 @@ export interface Token {
  * awaits either transparently.
  */
 export interface TokenRingStorageAdapter {
-    /**
-     * Register (or re-register) this server in the ring membership table.
-     */
-    register(key: TokenRingRegistrationKey, value: TokenRingRegistrationValue): void | Promise<void>
-
-    /**
-     * Remove this server's registration from the ring membership table.
-     * Called on graceful shutdown.
-     */
-    deregister(key: TokenRingRegistrationKey): void | Promise<void>
-
-    /**
-     * Get the next server in the ring after the given key (ordered by the storage backend's key ordering).
-     * If the given key is the last in the segment, wraps around to the first server in that segment.
-     * Returns null only if no servers exist (which should be impossible — at minimum, "this" server is registered).
-     */
-    getNextInRing(afterKey: TokenRingRegistrationKey, segmentName: string): Promise<TokenRingRegistrationKey | null>
-
-    /**
-     * Atomically read and remove a server's registration.
-     * Returns the registration value if it existed, or null if already gone.
-     * Used when marking a server as unresponsive.
-     */
-    removeRegistration(key: TokenRingRegistrationKey): Promise<TokenRingRegistrationValue | null>
+    /** access to the underlying table for registrations */
+    doTn: MVCCCore.TransactionFactory<TokenRingRegistrationKey, TokenRingRegistrationValue>
 }
 
 // ─── Config ──────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ import crypto from "crypto";
 import { test, expect } from "vitest";
 import { TokenRingWorkDistributor } from "../src/tokenRing";
 import { Token, TokenFlags, TokenRingConfig, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
-import { TestingStore } from "./store";
+import { BySegmentName, TestingStore } from "./store";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const createGUID = () => {
     const id = crypto.randomBytes(16).toString("hex");
@@ -227,7 +227,7 @@ test("tokenRing: server registers itself in WorkflowRingRegistration table", asy
 
         // Check the registration table
         const registrations = await TestingStore.doTransaction(async txn => {
-            return txn.getUsingFilter((v) => v.segment_name === segmentName);
+            return txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
         });
 
         expect(registrations.length).toBeGreaterThanOrEqual(1);
@@ -239,8 +239,7 @@ test("tokenRing: server registers itself in WorkflowRingRegistration table", asy
 
         // Clean up registrations
         await TestingStore.doTn(async txn => {
-
-            const regs = txn.getUsingFilter((v) => v.segment_name === segmentName);
+            const regs = await txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
             for (const [k] of regs) {
                 txn.clear(k);
             }
@@ -263,7 +262,7 @@ test("tokenRing: destroyed server deregisters from table", async () => {
     await sleep(500);
 
     const registrations = await TestingStore.doTn(async txn => {
-        return txn.getUsingFilter((v) => v.segment_name === segmentName);
+        return txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
     });
 
     expect(registrations.length).toBe(0);
@@ -308,7 +307,7 @@ test("tokenRing: re-registration refreshes the membership entry", async () => {
 
         // Capture the initial last_seen timestamp
         const initial = await TestingStore.doTransaction(async txn => {
-            const regs = txn.getUsingFilter((v) => v.segment_name === segmentName);
+            const regs = await txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
             return regs[0]?.[1]?.last_seen ?? 0;
         });
         expect(initial).toBeGreaterThan(0);
@@ -317,7 +316,7 @@ test("tokenRing: re-registration refreshes the membership entry", async () => {
         await sleep(600);
 
         const updated = await TestingStore.doTransaction(async txn => {
-            const regs = txn.getUsingFilter((v) => v.segment_name === segmentName);
+            const regs = await txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
             return regs[0]?.[1]?.last_seen ?? 0;
         });
 

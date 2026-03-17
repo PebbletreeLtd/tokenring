@@ -167,21 +167,20 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
                 this.worker = null
             }
             if (this.token_timer) clearTimeout(this.token_timer)
-            const deregisterResult = this.options.storage.deregister({
-                segment_name: this.options.segment_name,
-                server_ip: this.boundAddress.address,
-                server_port: this.boundAddress.port
-            })
-            if (deregisterResult instanceof Promise) {
-                deregisterResult.catch(e => this.log.error(e))
-            }
+            this.options.storage.doTn(async txn => {
+                txn.clear({
+                    segment_name: this.options.segment_name,
+                    server_ip: this.boundAddress.address,
+                    server_port: this.boundAddress.port
+                })
+            }).catch(e => this.log.error("Error during deregistration", e))
         }
     }
     private async Register() {
-        await this.options.storage.register(
-            { segment_name: this.options.segment_name, server_ip: this.boundAddress.address, server_port: this.boundAddress.port },
-            { last_seen: Date.now(), executor_id: this.issuer_id }
-        )
+        await this.options.storage.doTn((async txn => {
+            txn.set({ segment_name: this.options.segment_name, server_ip: this.boundAddress.address, server_port: this.boundAddress.port },
+                { last_seen: Date.now(), executor_id: this.issuer_id })
+        }))
     }
     private async RunRegistrationForever() {
         while (!this.destroyed) {
@@ -270,15 +269,44 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
             }
         })
     }
-    private async GetNextServerInRing() {
-        const candidateKey = await this.options.storage.getNextInRing(
-            { segment_name: this.options.segment_name, server_ip: this.boundAddress.address, server_port: this.boundAddress.port },
-            this.options.segment_name
-        )
-        if (!candidateKey) {
+    private async GetNextServerInRing(): Promise<TokenRingRegistrationKey> {
+        const candidate = await this.options.storage.doTn(async txn => {
+            const records = await txn.getRangeAll(
+                {
+                    segment_name: this.options.segment_name,
+                    server_ip: this.boundAddress.address,
+                    server_port: this.boundAddress.port
+                }, {
+                segment_name: this.options.segment_name,
+                server_ip: Buffer.from([255]).toString(), // hack to get a string that sorts after all valid ips
+                server_port: 65535
+            }, { limit: 2 });
+            const [found] = records.filter(([k]) => k.server_ip !== this.boundAddress.address || k.server_port !== this.boundAddress.port)
+            if (found) {
+                return found
+            }
+            //if we didn't find any greater, wrap around to the first in the segment
+            const [first] = await txn.getRangeAll(
+                {
+                    segment_name: this.options.segment_name,
+                    server_ip: Buffer.from([0]).toString(), // hack to get a string that sorts before all valid ips
+                    server_port: 0
+                }, {
+                segment_name: this.options.segment_name,
+                server_ip: Buffer.from([255]).toString(), // hack to get a string that sorts after all valid ips
+                server_port: 65535
+            }, { limit: 1 })
+            if (first) {
+                return first
+            }
+            return null
+        })
+
+        if (!candidate) {
             throw new Error("Unexpected condition, no servers in cluster (expected at least me)")
         }
-        return candidateKey
+        const [key] = candidate
+        return key
     }
     private async TokenReceived(token: Token) {
         if (this.destroyed) return;
@@ -364,7 +392,14 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
         }
     }
     private async MarkServerAsUnresponsive(key: TokenRingRegistrationKey) {
-        const value = await this.options.storage.removeRegistration(key)
+        const value = await this.options.storage.doTn(async txn => {
+            const value = await txn.get(key);
+            if (value) {
+                txn.clear(key)
+            }
+            return value
+
+        })
         if (!value) return; //already gone, maybe by another server that also noticed the issue
         //notify the consumer to handle orphaned job cleanup
         await this.options.onServerUnresponsive?.({ key, value })
