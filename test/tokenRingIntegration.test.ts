@@ -10,12 +10,10 @@
  * UDP sockets bound to localhost. They require FDB.
  */
 console.log()
-import { TestTokenRingStorageAdapter } from "./tokenRingAdapter";
 import crypto from "crypto";
 import { test, expect } from "vitest";
-import { TokenRingWorkDistributor } from "../src/tokenRing";
-import { Token, TokenFlags, TokenRingConfig, TokenRingRegistrationValue, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
-import { BySegmentName, TestingStore } from "./store";
+import { Token, TokenFlags, TokenRingConfig, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
+import { TestingTokenRingDistributor } from "./testingTokenRingDistributor";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const createGUID = () => {
     const id = crypto.randomBytes(16).toString("hex");
@@ -37,10 +35,11 @@ function testTokenRingConfig(overrides?: Partial<TokenRingConfig>): TokenRingCon
 async function createTestTokenRing(options: {
     segmentName: string,
     capabilities: Buffer,
+    store?: TestingTokenRingDistributor["TestingStore"],
     config?: Partial<TokenRingConfig>,
     onToken?: (ctx: { ring: TokenRingWorkDistributorInterface, token: Readonly<Token>, done: (workload: { running: number }) => void, error: (e: any) => void }) => void,
     onServerUnresponsive?: (reg: { key: any, value: any }) => void | Promise<void>,
-}): Promise<{ tr: TokenRingWorkDistributor<TokenRingRegistrationValue>, rounds: () => number, lastToken: () => Token | null }> {
+}): Promise<{ tr: TestingTokenRingDistributor, rounds: () => number, lastToken: () => Token | null }> {
     let roundCount = 0;
     let lastSeenToken: Token | null = null;
 
@@ -49,24 +48,28 @@ async function createTestTokenRing(options: {
     }
     const userHandler = options.onToken ?? defaultHandler;
 
-    const tr = await new TokenRingWorkDistributor({
+    const tr = await new TestingTokenRingDistributor({
         segment_name: options.segmentName,
         capabilities: options.capabilities,
         config: testTokenRingConfig(options.config),
-        storage: new TestTokenRingStorageAdapter(),
+
+
+        issuer_id: createGUID(),
+    }, {
+        store: options.store,
         onToken: (ctx) => {
             roundCount++;
             lastSeenToken = ctx.token;
             userHandler(ctx);
         },
         onServerUnresponsive: options.onServerUnresponsive,
-        issuer_id: createGUID(),
     }).Start();
 
     return {
         tr,
         rounds: () => roundCount,
         lastToken: () => lastSeenToken,
+
     };
 }
 
@@ -158,7 +161,7 @@ test("tokenRing: capabilities merge across servers with different caps", async (
     const config: Partial<TokenRingConfig> = { token_ack_timeout_ms: 1000 };
 
     const { tr: tr1 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType]), config });
-    const { tr: tr2 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType2]), config });
+    const { tr: tr2 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType2]), config, store: tr1.TestingStore });
 
     try {
         // Wait until the token has completed a full loop (provisional flag cleared on both servers)
@@ -226,8 +229,8 @@ test("tokenRing: server registers itself in WorkflowRingRegistration table", asy
         await sleep(200);
 
         // Check the registration table
-        const registrations = await TestingStore.doTransaction(async txn => {
-            return txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
+        const registrations = await tr.doTn(async txn => {
+            return txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
         });
 
         expect(registrations.length).toBeGreaterThanOrEqual(1);
@@ -238,8 +241,8 @@ test("tokenRing: server registers itself in WorkflowRingRegistration table", asy
         tr.Destroy();
 
         // Clean up registrations
-        await TestingStore.doTn(async txn => {
-            const regs = await txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
+        await tr.doTn(async txn => {
+            const regs = await txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
             for (const [k] of regs) {
                 txn.clear(k);
             }
@@ -261,8 +264,8 @@ test("tokenRing: destroyed server deregisters from table", async () => {
     // Give it a moment to deregister
     await sleep(500);
 
-    const registrations = await TestingStore.doTn(async txn => {
-        return txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
+    const registrations = await tr.doTn(async txn => {
+        return txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
     });
 
     expect(registrations.length).toBe(0);
@@ -306,8 +309,8 @@ test("tokenRing: re-registration refreshes the membership entry", async () => {
         await sleep(200);
 
         // Capture the initial last_seen timestamp
-        const initial = await TestingStore.doTransaction(async txn => {
-            const regs = await txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
+        const initial = await tr.doTn(async txn => {
+            const regs = await txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
             return regs[0]?.[1]?.last_seen ?? 0;
         });
         expect(initial).toBeGreaterThan(0);
@@ -315,8 +318,8 @@ test("tokenRing: re-registration refreshes the membership entry", async () => {
         // Wait long enough for at least one re-registration cycle
         await sleep(600);
 
-        const updated = await TestingStore.doTransaction(async txn => {
-            const regs = await txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
+        const updated = await tr.doTn(async txn => {
+            const regs = await txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
             return regs[0]?.[1]?.last_seen ?? 0;
         });
 
@@ -337,13 +340,15 @@ test("tokenRing: works with various issuer_id formats", async () => {
     // Use a UUID-style id with dashes
     const uuidStyleId = `${createGUID().slice(0, 8)}-${createGUID().slice(0, 4)}-${createGUID().slice(0, 4)}-${createGUID().slice(0, 12)}`;
 
-    const tr = await new TokenRingWorkDistributor({
+    const tr = await new TestingTokenRingDistributor({
         segment_name: segmentName,
         capabilities,
         config: testTokenRingConfig(),
-        storage: new TestTokenRingStorageAdapter(),
-        onToken: (ctx) => { ctx.done({ running: 0 }); },
+
         issuer_id: uuidStyleId,
+
+    }, {
+        onToken: (ctx) => { ctx.done({ running: 0 }); },
     }).Start();
 
     try {
@@ -376,15 +381,15 @@ test("tokenRing: re-registration preserves extra optional members on the value",
         await sleep(200);
 
         // Read back the registration key so we know the IP/port the ring bound to
-        const regs = await TestingStore.doTransaction(async txn => {
-            return txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
+        const regs = await tr.doTn(async txn => {
+            return txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
         });
         expect(regs.length).toBe(1);
         const [regKey, regValue] = regs[0]!;
 
         // Inject an extra optional field directly into the stored record,
         // simulating a consumer's extended value type (e.g. { hostname?: string }).
-        await TestingStore.doTransaction(async txn => {
+        await tr.doTn(async txn => {
             txn.set(regKey, {
                 ...regValue,
                 hostname: "test-host.local",
@@ -392,14 +397,14 @@ test("tokenRing: re-registration preserves extra optional members on the value",
         });
 
         // Confirm the extra field is there
-        const before = await TestingStore.doTransaction(async txn => txn.get(regKey)) as any;
+        const before = await tr.doTn(async txn => txn.get(regKey)) as any;
         expect(before.hostname).toBe("test-host.local");
 
         // Wait for at least one re-registration cycle
         await sleep(600);
 
         // Read back and verify the extra field survived
-        const after = await TestingStore.doTransaction(async txn => txn.get(regKey)) as any;
+        const after = await tr.doTn(async txn => txn.get(regKey)) as any;
         expect(after.hostname).toBe("test-host.local");
         // And the library's own fields were updated
         expect(after.last_seen).toBeGreaterThan(regValue.last_seen);

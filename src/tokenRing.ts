@@ -9,6 +9,7 @@ import {
     TokenRingOptions,
     TokenRingConfig,
     TokenRingWorkDistributorInterface,
+    TokenRingRegistrationValue,
 } from "./tokenRingTypes"
 
 interface Logger {
@@ -59,36 +60,27 @@ function mergeCapabilityBuffers(target: Buffer, source: Buffer): Buffer {
 // Re-export types that consumers need
 
 
-function defaultDetermineLocalIP(): { address: string } {
-    const interfaces = os.networkInterfaces()
-    const flatInterfaces = Object.keys(interfaces).map(k => interfaces[k]?.map(i => ({ name: k, ...i })) || []).flatMap(v => v)
-        .filter(v => !v.internal && (v.family == "IPv4" || (v.family as any) === 4))
-    const eth0 = flatInterfaces.find(v => !!v.name.match(/^e.*0$/))
-    if (eth0)
-        return eth0
-    throw new Error("Unable to determine local ip of eth0")
-}
 
-export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterface {
+export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDistributorInterface {
     readonly issuer_id;
-    private issuer_version = 1
+    protected issuer_version = 1
     last_seen_token: { token: Token, last_seen: number }
-    private token_timer: any = undefined
-    private worker: Worker | null = null
-    private boundAddress: { address: string, port: number } = { address: "", port: 0 }
-    private averageLoopDuration = process.platform === "darwin" ? 2500 : 30000
-    private readonly server_reregister_time_ms
-    private destroyed: boolean = false
+    protected token_timer: any = undefined
+    protected worker: Worker | null = null
+    protected boundAddress: { address: string, port: number } = { address: "", port: 0 }
+    protected averageLoopDuration = process.platform === "darwin" ? 2500 : 30000
+    protected readonly server_reregister_time_ms
+    protected destroyed: boolean = false
     readonly segmentName
 
     readonly config: Readonly<TokenRingConfig>
-    private readonly log: Logger
-    constructor(private options: TokenRingOptions) {
-        this.config = options.config
-        this.log = createLogger(!!options.config.verbose)
-        this.issuer_id = options.issuer_id
-        this.server_reregister_time_ms = options.config.reregister_time_ms
-        this.segmentName = options.segment_name
+    protected readonly log: Logger
+    constructor(protected args: TokenRingOptions) {
+        this.config = args.config
+        this.log = createLogger(!!args.config.verbose)
+        this.issuer_id = args.issuer_id
+        this.server_reregister_time_ms = args.config.reregister_time_ms
+        this.segmentName = args.segment_name
         this.last_seen_token = {
             last_seen: 0,
             token: {
@@ -96,7 +88,7 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
                 issued_by: "",
                 issuer_version: 0,
                 server_count: 0,
-                capabilities: this.options.capabilities,
+                capabilities: this.args.capabilities,
                 flags: TokenFlags.provisional
             }
         }
@@ -120,9 +112,9 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
         return this
     }
 
-    private async Listen() {
+    protected async Listen() {
         let listenPort = 5000;
-        const localIP = (this.options.getLocalAddress ?? defaultDetermineLocalIP)()
+        const localIP = this.getLocalAddress();
         while (listenPort < 65536) {
             try {
                 await new Promise<void>((R, E) => {
@@ -154,11 +146,11 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
             this.destroyed = true;
             if (cause) {
                 this.log.error("Destroying TokenRing due to Error", cause)
-                this.options.onError?.(cause)
+                this.onError(cause)
             }
             else {
                 this.log.log("Destroying TokenRing")
-                this.options.onDestroy?.()
+                this.onDestroy()
             }
             if (this.worker) {
                 this.worker.removeAllListeners()
@@ -166,25 +158,25 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
                 this.worker.terminate().catch(() => { })
                 this.worker = null
             }
-            if (this.token_timer) clearTimeout(this.token_timer)
-            this.options.storage.doTn(async txn => {
-                txn.clear({
-                    segment_name: this.options.segment_name,
+            if (this.token_timer) clearTimeout(this.token_timer);
+            this.doTn(async txn => {
+                return this.clearTokenRingRegistration(txn, {
+                    segment_name: this.args.segment_name,
                     server_ip: this.boundAddress.address,
                     server_port: this.boundAddress.port
                 })
             }).catch(e => this.log.error("Error during deregistration", e))
         }
     }
-    private async Register() {
+    protected async Register() {
         const key = {
-            segment_name: this.options.segment_name,
+            segment_name: this.args.segment_name,
             server_ip: this.boundAddress.address,
             server_port: this.boundAddress.port,
         }
-        await this.options.storage.doTn(async txn => {
-            const existing = await txn.get(key)
-            txn.set(key, {
+        await this.doTn(async txn => {
+            const existing = await this.getTokenRingRegistration(txn, key)
+            this.setTokenRingRegistration(txn, key, {
                 // Spread preserves optional members the consumer may have added.
                 // When existing is undefined (first write) the spread is a no-op;
                 // Is the storage adapter uses invariant types we know that any additional props are optional
@@ -194,7 +186,7 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
             })
         })
     }
-    private async RunRegistrationForever() {
+    protected async RunRegistrationForever() {
         while (!this.destroyed) {
             try {
                 await new Promise(R => setTimeout(R, this.server_reregister_time_ms))
@@ -204,11 +196,11 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
             }
         }
     }
-    private prefixes = {
+    protected prefixes = {
         ACK: 1,
         TOKEN: 2
     }
-    private deserializeToken(buf: Buffer): Token {
+    protected deserializeToken(buf: Buffer): Token {
         const prefix = buf[0];
         if (prefix !== this.prefixes.TOKEN) {
             throw new Error("Invalid token prefix")
@@ -229,12 +221,12 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
         }
 
     }
-    private serializeToken(token: Token): Buffer {
+    protected serializeToken(token: Token): Buffer {
         //we'll use an fdb tuple pack for the binary format
         return Buffer.concat([this.tokenBuffer, tuple.pack([token.issued_by, token.issuer_version, token.averageWorkload, token.server_count, token.capabilities, token.flags])])
     }
-    private tokenBuffer = Buffer.alloc(1, this.prefixes.TOKEN)
-    private BindWorkerEvents() {
+    protected tokenBuffer = Buffer.alloc(1, this.prefixes.TOKEN)
+    protected BindWorkerEvents() {
         this.worker!.on("message", async (msg: any) => {
             try {
                 if (msg.type === "token") {
@@ -281,46 +273,10 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
             }
         })
     }
-    private async GetNextServerInRing(): Promise<TokenRingRegistrationKey> {
-        const candidate = await this.options.storage.doTn(async txn => {
-            const records = await txn.getRangeAll(
-                {
-                    segment_name: this.options.segment_name,
-                    server_ip: this.boundAddress.address,
-                    server_port: this.boundAddress.port
-                }, {
-                segment_name: this.options.segment_name,
-                server_ip: Buffer.from([255]).toString(), // hack to get a string that sorts after all valid ips
-                server_port: 65535
-            }, { limit: 2 });
-            const [found] = records.filter(([k]) => k.server_ip !== this.boundAddress.address || k.server_port !== this.boundAddress.port)
-            if (found) {
-                return found
-            }
-            //if we didn't find any greater, wrap around to the first in the segment
-            const [first] = await txn.getRangeAll(
-                {
-                    segment_name: this.options.segment_name,
-                    server_ip: Buffer.from([0]).toString(), // hack to get a string that sorts before all valid ips
-                    server_port: 0
-                }, {
-                segment_name: this.options.segment_name,
-                server_ip: Buffer.from([255]).toString(), // hack to get a string that sorts after all valid ips
-                server_port: 65535
-            }, { limit: 1 })
-            if (first) {
-                return first
-            }
-            return null
-        })
+    abstract GetNextServerInRing(txn: TXN_T): Promise<TokenRingRegistrationKey | null>
+    abstract GetFirstServerInRing(txn: TXN_T): Promise<TokenRingRegistrationKey | null>
 
-        if (!candidate) {
-            throw new Error("Unexpected condition, no servers in cluster (expected at least me)")
-        }
-        const [key] = candidate
-        return key
-    }
-    private async TokenReceived(token: Token) {
+    protected async TokenReceived(token: Token) {
         if (this.destroyed) return;
         try {
             if (token.issuer_version !== this.last_seen_token.token.issuer_version) {
@@ -329,12 +285,12 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
             this.log.debug("Received token ", token)
             this.last_seen_token = { token, last_seen: Date.now() }
             //or my own capabilities into the token
-            token.capabilities = mergeCapabilityBuffers(token.capabilities, this.options.capabilities)
+            token.capabilities = mergeCapabilityBuffers(token.capabilities, this.args.capabilities)
             this.startLostTokenTimer()
             //do some work
             try {
                 const workload = await new Promise<number>((R, E) => {
-                    this.options.onToken({
+                    this.onToken({
                         ring: this,
                         token,
                         done: (workload) => {
@@ -348,7 +304,10 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
                 this.log.error("Unhandled work handler error", e)
             }
             while (!this.destroyed) {
-                let nextKey = await this.GetNextServerInRing();
+                let nextKey = await this.doTn(async txn => await this.GetNextServerInRing(txn) || await this.GetFirstServerInRing(txn));
+                if (!nextKey) {
+                    throw new Error("No servers found in ring")
+                }
                 if (nextKey.server_ip === this.boundAddress.address && nextKey.server_port === this.boundAddress.port) {
                     //throttle if we are the only one at the party
                     await new Promise(R => setTimeout(R, 100));
@@ -381,7 +340,7 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
                             awaitAck: {
                                 ip: nextKey.server_ip,
                                 port: nextKey.server_port,
-                                timeoutMs: this.options.config.token_ack_timeout_ms,
+                                timeoutMs: this.args.config.token_ack_timeout_ms,
                             }
                         })
                     })
@@ -403,31 +362,31 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
             throw e;
         }
     }
-    private async MarkServerAsUnresponsive(key: TokenRingRegistrationKey) {
-        const value = await this.options.storage.doTn(async txn => {
-            const value = await txn.get(key);
+    protected async MarkServerAsUnresponsive(key: TokenRingRegistrationKey) {
+        const value = await this.doTn(async txn => {
+            const value = await this.getTokenRingRegistration(txn, key);
             if (value) {
-                txn.clear(key)
+                this.clearTokenRingRegistration(txn, key)
             }
             return value
 
         })
         if (!value) return; //already gone, maybe by another server that also noticed the issue
         //notify the consumer to handle orphaned job cleanup
-        await this.options.onServerUnresponsive?.({ key, value })
+        await this.onServerUnresponsive({ key, value })
     }
 
-    private _everLoaded = false;
-    private startLostTokenTimer() {
+    protected _everLoaded = false;
+    protected startLostTokenTimer() {
         if (this.token_timer) clearTimeout(this.token_timer)
         if (this.destroyed) return
-        const timeout = this.options.config.skipInitialTokenTimeout && !this._everLoaded
+        const timeout = this.args.config.skipInitialTokenTimeout && !this._everLoaded
             ? 0
             : Math.max(this.averageLoopDuration * 3, 2000)
         this.log.debug("Waiting for", timeout, " before timing token out")
         this.token_timer = setTimeout(() => {
             if (this.destroyed) return
-            if (!this.options.config.skipInitialTokenTimeout || this._everLoaded)
+            if (!this.args.config.skipInitialTokenTimeout || this._everLoaded)
                 this.log.warn(`Token receive timeout ${this.segmentName}`)
             this._everLoaded = true;
             //issue a new token, force it to be sent, even if the issued by isn't higher
@@ -436,9 +395,55 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
                 server_count: 0,
                 issuer_version: ++this.issuer_version,
                 averageWorkload: this.last_seen_token.token.averageWorkload,
-                capabilities: this.options.capabilities,
+                capabilities: this.args.capabilities,
                 flags: TokenFlags.provisional
             }).catch(() => this.Destroy())
         }, timeout)
+    }
+    abstract doTn<R>(callback: (txn: TXN_T) => Promise<R>): Promise<R>;
+    abstract clearTokenRingRegistration(txn: TXN_T, key: TokenRingRegistrationKey): void;
+    abstract getTokenRingRegistration(txn: TXN_T, key: TokenRingRegistrationKey): Promise<TokenRingRegistrationValue | undefined>;
+    abstract setTokenRingRegistration(txn: TXN_T, key: TokenRingRegistrationKey, value: TokenRingRegistrationValue): void;
+    abstract onToken(ctx: {
+        ring: TokenRingWorkDistributorInterface
+        token: Readonly<Token>
+        done: (workload: { running: number }) => void
+        error: (e: any) => void
+    }): void
+    /**
+ * Called when the token ring detects that a server is unresponsive
+ * (failed to ACK a forwarded token). The ring has already removed 
+ * the dead server's registration. The consumer is responsible for 
+ * any cleanup (e.g. resetting orphaned jobs).
+ */
+
+    onServerUnresponsive(registration: {
+        key: TokenRingRegistrationKey
+        value: TokenRingRegistrationValue
+    }): void | Promise<void> {
+        //no-op by default, consumer can override to handle cleanup of orphaned jobs, etc.
+        console.warn("Server unresponsive", JSON.stringify(registration))
+    }
+    onError(e: any): void {
+        //no-op by default, consumer can override to handle errors
+        console.error("TokenRing error", e)
+    }
+    onDestroy(): void {
+        //no-op by default, consumer can override to handle destruction
+        console.log("TokenRing destroyed")
+    }
+    /**
+     * Optional: override local IP/interface discovery.
+     * Defaults to finding the first non-internal IPv4 interface matching /^e.*0$/ (eth0, en0, etc.)
+     */
+    getLocalAddress(): { address: string } {
+        console.log("Discovering local IP address using default method. Override getLocalAddress() to customize this behaviour.")
+        const interfaces = os.networkInterfaces()
+        const flatInterfaces = Object.keys(interfaces).map(k => interfaces[k]?.map(i => ({ name: k, ...i })) || []).flatMap(v => v)
+            .filter(v => !v.internal && (v.family == "IPv4" || (v.family as any) === 4))
+        const eth0 = flatInterfaces.find(v => !!v.name.match(/^e.*0$/))
+        if (eth0)
+            return eth0
+        throw new Error("Unable to determine local ip of eth0")
     }
 }
