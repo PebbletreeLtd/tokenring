@@ -11,6 +11,7 @@ import {
     TokenRingWorkDistributorInterface,
     TokenRingRegistrationValue,
 } from "./tokenRingTypes"
+import { MVCCCore } from "@pebbletree/mvcc-testing"
 
 interface Logger {
     debug(...args: any[]): void
@@ -61,7 +62,7 @@ function mergeCapabilityBuffers(target: Buffer, source: Buffer): Buffer {
 
 
 
-export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDistributorInterface {
+export abstract class TokenRingWorkDistributor implements TokenRingWorkDistributorInterface {
     readonly issuer_id;
     protected issuer_version = 1
     last_seen_token: { token: Token, last_seen: number }
@@ -72,7 +73,7 @@ export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDi
     protected readonly server_reregister_time_ms
     protected destroyed: boolean = false
     readonly segmentName
-
+    readonly doTn;
     readonly config: Readonly<TokenRingConfig>
     protected readonly log: Logger
     constructor(protected args: TokenRingOptions) {
@@ -92,6 +93,7 @@ export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDi
                 flags: TokenFlags.provisional
             }
         }
+        this.doTn = args.doTn
     }
     get Token() {
         return this.last_seen_token.token
@@ -160,7 +162,7 @@ export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDi
             }
             if (this.token_timer) clearTimeout(this.token_timer);
             this.doTn(async txn => {
-                return this.clearTokenRingRegistration(txn, {
+                return txn.clear({
                     segment_name: this.args.segment_name,
                     server_ip: this.boundAddress.address,
                     server_port: this.boundAddress.port
@@ -175,8 +177,8 @@ export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDi
             server_port: this.boundAddress.port,
         }
         await this.doTn(async txn => {
-            const existing = await this.getTokenRingRegistration(txn, key)
-            this.setTokenRingRegistration(txn, key, {
+            const existing = await txn.get(key)
+            txn.set(key, {
                 // Spread preserves optional members the consumer may have added.
                 // When existing is undefined (first write) the spread is a no-op;
                 // Is the storage adapter uses invariant types we know that any additional props are optional
@@ -273,8 +275,44 @@ export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDi
             }
         })
     }
-    abstract GetNextServerInRing(txn: TXN_T): Promise<TokenRingRegistrationKey | null>
-    abstract GetFirstServerInRing(txn: TXN_T): Promise<TokenRingRegistrationKey | null>
+
+    private async GetNextServerInRing(txn: MVCCCore.ITransaction<TokenRingRegistrationKey, TokenRingRegistrationKey, TokenRingRegistrationValue, TokenRingRegistrationValue>): Promise<TokenRingRegistrationKey | null> {
+
+        const [record] = await txn.getRangeAll(
+            {
+                segment_name: this.args.segment_name,
+                server_ip: this.boundAddress.address,
+                server_port: this.boundAddress.port + 1,
+            },
+            {
+                segment_name: this.args.segment_name,
+                server_ip: "\xFF",
+                server_port: Number.MAX_SAFE_INTEGER,
+            },
+            {
+                limit: 1
+            }
+        );
+        return record ? record[0] : null
+    }
+    private async GetFirstServerInRing(txn: MVCCCore.ITransaction<TokenRingRegistrationKey, TokenRingRegistrationKey, TokenRingRegistrationValue, TokenRingRegistrationValue>): Promise<TokenRingRegistrationKey | null> {
+        const [record] = await txn.getRangeAll(
+            {
+                segment_name: this.args.segment_name,
+                server_ip: "\x00",
+                server_port: 0,
+            },
+            {
+                segment_name: this.args.segment_name,
+                server_ip: "\xFF",
+                server_port: Number.MAX_SAFE_INTEGER,
+            },
+            {
+                limit: 1
+            }
+        );
+        return record ? record[0] : null
+    }
 
     protected async TokenReceived(token: Token) {
         if (this.destroyed) return;
@@ -364,9 +402,9 @@ export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDi
     }
     protected async MarkServerAsUnresponsive(key: TokenRingRegistrationKey) {
         const value = await this.doTn(async txn => {
-            const value = await this.getTokenRingRegistration(txn, key);
+            const value = await txn.get(key);
             if (value) {
-                this.clearTokenRingRegistration(txn, key)
+                txn.clear(key)
             }
             return value
 
@@ -400,10 +438,6 @@ export abstract class TokenRingWorkDistributor<TXN_T> implements TokenRingWorkDi
             }).catch(() => this.Destroy())
         }, timeout)
     }
-    abstract doTn<R>(callback: (txn: TXN_T) => Promise<R>): Promise<R>;
-    abstract clearTokenRingRegistration(txn: TXN_T, key: TokenRingRegistrationKey): void;
-    abstract getTokenRingRegistration(txn: TXN_T, key: TokenRingRegistrationKey): Promise<TokenRingRegistrationValue | undefined>;
-    abstract setTokenRingRegistration(txn: TXN_T, key: TokenRingRegistrationKey, value: TokenRingRegistrationValue): void;
     abstract onToken(ctx: {
         ring: TokenRingWorkDistributorInterface
         token: Readonly<Token>

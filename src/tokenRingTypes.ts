@@ -8,6 +8,8 @@
  * Designed for eventual extraction into a standalone npm package.
  */
 
+import { TransactionFactory } from "@pebbletree/mvcc-testing/dist/types"
+
 // ─── Ring Registration ───────────────────────────────────────────────
 
 export interface TokenRingRegistrationKey {
@@ -73,5 +75,6 @@ export interface TokenRingOptions {
     segment_name: string
     capabilities: Buffer
     issuer_id: string,
-    config: TokenRingConfig
+    config: TokenRingConfig,
+    doTn: TransactionFactory<TokenRingRegistrationKey, TokenRingRegistrationValue>;
 }

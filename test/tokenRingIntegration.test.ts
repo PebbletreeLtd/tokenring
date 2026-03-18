@@ -14,6 +14,7 @@ import crypto from "crypto";
 import { test, expect } from "vitest";
 import { Token, TokenFlags, TokenRingConfig, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
 import { TestingTokenRingDistributor } from "./testingTokenRingDistributor";
+import { segmentSubspace, TestingStore } from "./store";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const createGUID = () => {
     const id = crypto.randomBytes(16).toString("hex");
@@ -35,7 +36,6 @@ function testTokenRingConfig(overrides?: Partial<TokenRingConfig>): TokenRingCon
 async function createTestTokenRing(options: {
     segmentName: string,
     capabilities: Buffer,
-    store?: TestingTokenRingDistributor["TestingStore"],
     config?: Partial<TokenRingConfig>,
     onToken?: (ctx: { ring: TokenRingWorkDistributorInterface, token: Readonly<Token>, done: (workload: { running: number }) => void, error: (e: any) => void }) => void,
     onServerUnresponsive?: (reg: { key: any, value: any }) => void | Promise<void>,
@@ -52,11 +52,9 @@ async function createTestTokenRing(options: {
         segment_name: options.segmentName,
         capabilities: options.capabilities,
         config: testTokenRingConfig(options.config),
-
-
+        doTn: TestingStore.doTn.bind(TestingStore),
         issuer_id: createGUID(),
     }, {
-        store: options.store,
         onToken: (ctx) => {
             roundCount++;
             lastSeenToken = ctx.token;
@@ -161,7 +159,7 @@ test("tokenRing: capabilities merge across servers with different caps", async (
     const config: Partial<TokenRingConfig> = { token_ack_timeout_ms: 1000 };
 
     const { tr: tr1 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType]), config });
-    const { tr: tr2 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType2]), config, store: tr1.TestingStore });
+    const { tr: tr2 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType2]), config });
 
     try {
         // Wait until the token has completed a full loop (provisional flag cleared on both servers)
@@ -230,7 +228,7 @@ test("tokenRing: server registers itself in WorkflowRingRegistration table", asy
 
         // Check the registration table
         const registrations = await tr.doTn(async txn => {
-            return txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
+            return txn.at(segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
         });
 
         expect(registrations.length).toBeGreaterThanOrEqual(1);
@@ -242,7 +240,7 @@ test("tokenRing: server registers itself in WorkflowRingRegistration table", asy
 
         // Clean up registrations
         await tr.doTn(async txn => {
-            const regs = await txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
+            const regs = await txn.at(segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
             for (const [k] of regs) {
                 txn.clear(k);
             }
@@ -265,7 +263,7 @@ test("tokenRing: destroyed server deregisters from table", async () => {
     await sleep(500);
 
     const registrations = await tr.doTn(async txn => {
-        return txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
+        return txn.at(segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
     });
 
     expect(registrations.length).toBe(0);
@@ -310,7 +308,7 @@ test("tokenRing: re-registration refreshes the membership entry", async () => {
 
         // Capture the initial last_seen timestamp
         const initial = await tr.doTn(async txn => {
-            const regs = await txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
+            const regs = await txn.at(segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
             return regs[0]?.[1]?.last_seen ?? 0;
         });
         expect(initial).toBeGreaterThan(0);
@@ -319,7 +317,7 @@ test("tokenRing: re-registration refreshes the membership entry", async () => {
         await sleep(600);
 
         const updated = await tr.doTn(async txn => {
-            const regs = await txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
+            const regs = await txn.at(segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
             return regs[0]?.[1]?.last_seen ?? 0;
         });
 
@@ -344,9 +342,8 @@ test("tokenRing: works with various issuer_id formats", async () => {
         segment_name: segmentName,
         capabilities,
         config: testTokenRingConfig(),
-
+        doTn: TestingStore.doTn.bind(TestingStore),
         issuer_id: uuidStyleId,
-
     }, {
         onToken: (ctx) => { ctx.done({ running: 0 }); },
     }).Start();
@@ -382,7 +379,7 @@ test("tokenRing: re-registration preserves extra optional members on the value",
 
         // Read back the registration key so we know the IP/port the ring bound to
         const regs = await tr.doTn(async txn => {
-            return txn.at(tr.segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
+            return txn.at(segmentSubspace).getRangeAllStartsWith({ segment_name: segmentName });
         });
         expect(regs.length).toBe(1);
         const [regKey, regValue] = regs[0]!;
