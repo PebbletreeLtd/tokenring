@@ -14,7 +14,7 @@ import { TestTokenRingStorageAdapter } from "./tokenRingAdapter";
 import crypto from "crypto";
 import { test, expect } from "vitest";
 import { TokenRingWorkDistributor } from "../src/tokenRing";
-import { Token, TokenFlags, TokenRingConfig, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
+import { Token, TokenFlags, TokenRingConfig, TokenRingRegistrationValue, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
 import { BySegmentName, TestingStore } from "./store";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const createGUID = () => {
@@ -40,7 +40,7 @@ async function createTestTokenRing(options: {
     config?: Partial<TokenRingConfig>,
     onToken?: (ctx: { ring: TokenRingWorkDistributorInterface, token: Readonly<Token>, done: (workload: { running: number }) => void, error: (e: any) => void }) => void,
     onServerUnresponsive?: (reg: { key: any, value: any }) => void | Promise<void>,
-}): Promise<{ tr: TokenRingWorkDistributor, rounds: () => number, lastToken: () => Token | null }> {
+}): Promise<{ tr: TokenRingWorkDistributor<TokenRingRegistrationValue>, rounds: () => number, lastToken: () => Token | null }> {
     let roundCount = 0;
     let lastSeenToken: Token | null = null;
 
@@ -351,6 +351,59 @@ test("tokenRing: works with various issuer_id formats", async () => {
 
         expect(tr.Token.issued_by).toBe(uuidStyleId);
         expect(tr.issuer_id).toBe(uuidStyleId);
+    } finally {
+        tr.Destroy();
+    }
+});
+
+// =========================================================================
+// Extended value: optional members not clobbered by re-registration
+// =========================================================================
+
+test("tokenRing: re-registration preserves extra optional members on the value", async () => {
+    const segmentName = `test-noclobber-${createGUID().slice(0, 8)}`;
+    const capabilities = Buffer.from([testPayloadType]);
+
+    // Start a ring with a short re-registration interval
+    const { tr } = await createTestTokenRing({
+        segmentName,
+        capabilities,
+        config: { reregister_time_ms: 300 },
+    });
+
+    try {
+        // Wait for initial registration
+        await sleep(200);
+
+        // Read back the registration key so we know the IP/port the ring bound to
+        const regs = await TestingStore.doTransaction(async txn => {
+            return txn.at(BySegmentName).getRangeAllStartsWith({ segment_name: segmentName });
+        });
+        expect(regs.length).toBe(1);
+        const [regKey, regValue] = regs[0]!;
+
+        // Inject an extra optional field directly into the stored record,
+        // simulating a consumer's extended value type (e.g. { hostname?: string }).
+        await TestingStore.doTransaction(async txn => {
+            txn.set(regKey, {
+                ...regValue,
+                hostname: "test-host.local",
+            } as any);
+        });
+
+        // Confirm the extra field is there
+        const before = await TestingStore.doTransaction(async txn => txn.get(regKey)) as any;
+        expect(before.hostname).toBe("test-host.local");
+
+        // Wait for at least one re-registration cycle
+        await sleep(600);
+
+        // Read back and verify the extra field survived
+        const after = await TestingStore.doTransaction(async txn => txn.get(regKey)) as any;
+        expect(after.hostname).toBe("test-host.local");
+        // And the library's own fields were updated
+        expect(after.last_seen).toBeGreaterThan(regValue.last_seen);
+        expect(after.executor_id).toBe(tr.issuer_id);
     } finally {
         tr.Destroy();
     }

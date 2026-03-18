@@ -47,9 +47,9 @@ export interface Token {
  * Implementations may return T or Promise<T> — the token ring
  * awaits either transparently.
  */
-export interface TokenRingStorageAdapter {
+export interface TokenRingStorageAdapter<V extends TokenRingRegistrationValue> {
     /** access to the underlying table for registrations */
-    doTn: MVCCCore.TransactionFactory<TokenRingRegistrationKey, TokenRingRegistrationValue>
+    doTn: MVCCCore.TransactionFactory<TokenRingRegistrationKey, V>
 }
 
 // ─── Config ──────────────────────────────────────────────────────────
@@ -85,9 +85,9 @@ export type TokenRingOnTokenHandler = (ctx: {
  * the dead server's registration. The consumer is responsible for 
  * any cleanup (e.g. resetting orphaned jobs).
  */
-export type TokenRingOnServerUnresponsiveHandler = (registration: {
+export type TokenRingOnServerUnresponsiveHandler<V extends TokenRingRegistrationValue> = (registration: {
     key: TokenRingRegistrationKey
-    value: TokenRingRegistrationValue
+    value: V
 }) => void | Promise<void>
 
 // ─── Public interface of the ring (exposed to onToken handler) ───────
@@ -103,14 +103,14 @@ export interface TokenRingWorkDistributorInterface {
 
 // ─── Constructor options ─────────────────────────────────────────────
 
-export interface TokenRingOptions {
+export interface TokenRingOptions<V extends TokenRingRegistrationValue> {
     segment_name: string
     capabilities: Buffer
     issuer_id: string,
     config: TokenRingConfig
-    storage: TokenRingStorageAdapter
+    storage: TokenRingStorageAdapter<V>
     onToken: TokenRingOnTokenHandler
-    onServerUnresponsive?: TokenRingOnServerUnresponsiveHandler
+    onServerUnresponsive?: TokenRingOnServerUnresponsiveHandler<V>
     onError?: (e: any) => void
     onDestroy?: () => void
     /**

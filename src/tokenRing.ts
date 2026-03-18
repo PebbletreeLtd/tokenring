@@ -6,6 +6,7 @@ import tuple from "fdb-tuple"
 import {
     Token, TokenFlags,
     TokenRingRegistrationKey,
+    TokenRingRegistrationValue,
     TokenRingOptions,
     TokenRingConfig,
     TokenRingWorkDistributorInterface,
@@ -69,7 +70,7 @@ function defaultDetermineLocalIP(): { address: string } {
     throw new Error("Unable to determine local ip of eth0")
 }
 
-export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterface {
+export class TokenRingWorkDistributor<V extends TokenRingRegistrationValue> implements TokenRingWorkDistributorInterface {
     readonly issuer_id;
     private issuer_version = 1
     last_seen_token: { token: Token, last_seen: number }
@@ -83,7 +84,7 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
 
     readonly config: Readonly<TokenRingConfig>
     private readonly log: Logger
-    constructor(private options: TokenRingOptions) {
+    constructor(private options: TokenRingOptions<V>) {
         this.config = options.config
         this.log = createLogger(!!options.config.verbose)
         this.issuer_id = options.issuer_id
@@ -177,10 +178,22 @@ export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterfa
         }
     }
     private async Register() {
-        await this.options.storage.doTn((async txn => {
-            txn.set({ segment_name: this.options.segment_name, server_ip: this.boundAddress.address, server_port: this.boundAddress.port },
-                { last_seen: Date.now(), executor_id: this.issuer_id })
-        }))
+        const key = {
+            segment_name: this.options.segment_name,
+            server_ip: this.boundAddress.address,
+            server_port: this.boundAddress.port,
+        }
+        await this.options.storage.doTn(async txn => {
+            const existing = await txn.get(key)
+            txn.set(key, {
+                // Spread preserves optional members the consumer may have added.
+                // When existing is undefined (first write) the spread is a no-op;
+                // `as V` is sound because V can only extend the base with optionals.
+                ...existing,
+                last_seen: Date.now(),
+                executor_id: this.issuer_id,
+            } as V)
+        })
     }
     private async RunRegistrationForever() {
         while (!this.destroyed) {
