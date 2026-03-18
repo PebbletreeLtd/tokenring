@@ -41,16 +41,19 @@ export interface Token {
 
 // ─── Storage Adapter ─────────────────────────────────────────────────
 
+
 /**
  * Storage adapter for the token ring's membership registry.
  * 
  * Implementations may return T or Promise<T> — the token ring
  * awaits either transparently.
  */
-export interface TokenRingStorageAdapter<V extends TokenRingRegistrationValue> {
+export interface TokenRingStorageAdapter {
     /** access to the underlying table for registrations */
-    doTn: MVCCCore.TransactionFactory<TokenRingRegistrationKey, V>
+    doTn: MVCCCore.TransactionFactory<TokenRingRegistrationKey, TokenRingRegistrationValue>
+    subspace: MVCCCore.ISubspace<TokenRingRegistrationKey, TokenRingRegistrationKey, TokenRingRegistrationValue, TokenRingRegistrationValue>
 }
+
 
 // ─── Config ──────────────────────────────────────────────────────────
 
@@ -85,9 +88,9 @@ export type TokenRingOnTokenHandler = (ctx: {
  * the dead server's registration. The consumer is responsible for 
  * any cleanup (e.g. resetting orphaned jobs).
  */
-export type TokenRingOnServerUnresponsiveHandler<V extends TokenRingRegistrationValue> = (registration: {
+export type TokenRingOnServerUnresponsiveHandler = (registration: {
     key: TokenRingRegistrationKey
-    value: V
+    value: TokenRingRegistrationValue
 }) => void | Promise<void>
 
 // ─── Public interface of the ring (exposed to onToken handler) ───────
@@ -103,14 +106,14 @@ export interface TokenRingWorkDistributorInterface {
 
 // ─── Constructor options ─────────────────────────────────────────────
 
-export interface TokenRingOptions<V extends TokenRingRegistrationValue> {
+export interface TokenRingOptions {
     segment_name: string
     capabilities: Buffer
     issuer_id: string,
     config: TokenRingConfig
-    storage: TokenRingStorageAdapter<V>
+    storage: TokenRingStorageAdapter
     onToken: TokenRingOnTokenHandler
-    onServerUnresponsive?: TokenRingOnServerUnresponsiveHandler<V>
+    onServerUnresponsive?: TokenRingOnServerUnresponsiveHandler
     onError?: (e: any) => void
     onDestroy?: () => void
     /**

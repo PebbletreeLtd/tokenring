@@ -6,7 +6,6 @@ import tuple from "fdb-tuple"
 import {
     Token, TokenFlags,
     TokenRingRegistrationKey,
-    TokenRingRegistrationValue,
     TokenRingOptions,
     TokenRingConfig,
     TokenRingWorkDistributorInterface,
@@ -70,7 +69,7 @@ function defaultDetermineLocalIP(): { address: string } {
     throw new Error("Unable to determine local ip of eth0")
 }
 
-export class TokenRingWorkDistributor<V extends TokenRingRegistrationValue> implements TokenRingWorkDistributorInterface {
+export class TokenRingWorkDistributor implements TokenRingWorkDistributorInterface {
     readonly issuer_id;
     private issuer_version = 1
     last_seen_token: { token: Token, last_seen: number }
@@ -84,7 +83,7 @@ export class TokenRingWorkDistributor<V extends TokenRingRegistrationValue> impl
 
     readonly config: Readonly<TokenRingConfig>
     private readonly log: Logger
-    constructor(private options: TokenRingOptions<V>) {
+    constructor(private options: TokenRingOptions) {
         this.config = options.config
         this.log = createLogger(!!options.config.verbose)
         this.issuer_id = options.issuer_id
@@ -188,11 +187,11 @@ export class TokenRingWorkDistributor<V extends TokenRingRegistrationValue> impl
             txn.set(key, {
                 // Spread preserves optional members the consumer may have added.
                 // When existing is undefined (first write) the spread is a no-op;
-                // `as V` is sound because V can only extend the base with optionals.
+                // Is the storage adapter uses invariant types we know that any additional props are optional
                 ...existing,
                 last_seen: Date.now(),
                 executor_id: this.issuer_id,
-            } as V)
+            })
         })
     }
     private async RunRegistrationForever() {

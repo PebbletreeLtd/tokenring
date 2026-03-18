@@ -9,7 +9,7 @@
  * These tests spin up real TokenRingWorkDistributor instances with real
  * UDP sockets bound to localhost. They require FDB.
  */
-
+console.log()
 import { TestTokenRingStorageAdapter } from "./tokenRingAdapter";
 import crypto from "crypto";
 import { test, expect } from "vitest";

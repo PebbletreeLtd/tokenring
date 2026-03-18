@@ -2,7 +2,7 @@ import { MVCCCore } from "@pebbletree/mvcc-testing"
 import { TokenRingRegistrationKey } from "../src"
 import { TokenRingRegistrationValue } from "../src/tokenRingTypes"
 import tuple from "fdb-tuple"
-export const TestingStore = new MVCCCore.MVCCStore<TokenRingRegistrationKey, TokenRingRegistrationKey, TokenRingRegistrationValue, TokenRingRegistrationValue>(
+export const TestingStore = new MVCCCore.Store<TokenRingRegistrationKey, TokenRingRegistrationKey, TokenRingRegistrationValue, TokenRingRegistrationValue>(
     {
         keyTransformer: {
             pack: (value) => tuple.pack([value.segment_name, value.server_ip, value.server_port]),

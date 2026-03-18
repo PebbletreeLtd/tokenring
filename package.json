@@ -26,7 +26,7 @@
     "url": "https://github.com/PebbletreeLtd/tokenring.git"
   },
   "dependencies": {
-    "@pebbletree/mvcc-testing": "~2.0.8",
+    "@pebbletree/mvcc-testing": "~2.1.4",
     "@types/node": "~25.5.0",
     "fdb-tuple": "~1.0.0"
   },
