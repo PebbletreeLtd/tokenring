@@ -477,9 +477,11 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
     }
     /**
      * Optional: override local IP/interface discovery.
-     * Defaults to finding the first non-internal IPv4 interface matching /^e.*0$/ (eth0, en0, etc.)
+     * If the transport provides `getLocalAddress()` it is used first.
+     * Otherwise falls back to finding the first non-internal IPv4 interface matching /^e.*0$/ (eth0, en0, etc.)
      */
     getLocalAddress(): { address: string } {
+        if (this.transport?.getLocalAddress) return this.transport.getLocalAddress()
         console.log("Discovering local IP address using default method. Override getLocalAddress() to customize this behaviour.")
         const interfaces = os.networkInterfaces()
         const flatInterfaces = Object.keys(interfaces).map(k => interfaces[k]?.map(i => ({ name: k, ...i })) || []).flatMap(v => v)

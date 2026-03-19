@@ -17,9 +17,5 @@ export class TestingTokenRingDistributor extends TokenRingWorkDistributor {
         if (this.options.createTransport) return this.options.createTransport()
         return super.createTransport()
     }
-    getLocalAddress() {
-        if (this.options.createTransport) return { address: "127.0.0.1" }
-        return super.getLocalAddress()
-    }
 
 }

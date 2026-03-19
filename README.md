@@ -40,7 +40,7 @@ npm install @pebbletree/tokenring
 | `onServerUnresponsive(registration)` | Logs a warning. Override to clean up orphaned work from evicted servers. |
 | `onError(e)` | Logs the error. Override for custom error handling. |
 | `onDestroy()` | Logs destruction. Override for graceful shutdown hooks. |
-| `getLocalAddress()` | Discovers the first non-internal IPv4 interface matching `/^e.*0$/` (eth0, en0, etc.). Override to control which interface/IP the ring binds to. |
+| `getLocalAddress()` | Defers to the transport's `getLocalAddress()` if present (e.g. `InMemoryTransport` returns `127.0.0.1`). Otherwise discovers the first non-internal IPv4 interface matching `/^e.*0$/` (eth0, en0, etc.). Override to control which interface/IP the ring binds to. |
 | `createTransport()` | Returns a real `worker_threads` Worker running the UDP socket. Override to return `InMemoryTransport` for testing. |
 
 ## Quick start
@@ -151,7 +151,6 @@ import { InMemoryTransport, TokenRingWorkDistributor } from "@pebbletree/tokenri
 
 class TestRing extends TokenRingWorkDistributor {
   protected createTransport() { return new InMemoryTransport() }
-  getLocalAddress() { return { address: "127.0.0.1" } }
 
   onToken({ done }) {
     done({ running: 0 })

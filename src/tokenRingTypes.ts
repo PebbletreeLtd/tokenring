@@ -82,6 +82,13 @@ export interface TokenRingTransport {
     removeAllListeners(): void
     postMessage(msg: any): void
     terminate(): Promise<number>
+    /**
+     * Optional: if the transport knows what local address to bind to
+     * (e.g. InMemoryTransport always uses 127.0.0.1), return it here.
+     * When present, the base class defers to this instead of probing
+     * real network interfaces.
+     */
+    getLocalAddress?(): { address: string }
 }
 
 // ─── Constructor options ─────────────────────────────────────────────

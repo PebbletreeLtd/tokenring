@@ -7,7 +7,6 @@
  * Usage:
  *   class TestRing extends TokenRingWorkDistributor {
  *       protected createTransport() { return new InMemoryTransport() }
- *       getLocalAddress() { return { address: "127.0.0.1" } }
  *   }
  *
  * Call `InMemoryTransport.clearRegistry()` between tests to avoid stale
@@ -29,6 +28,10 @@ export class InMemoryTransport implements TokenRingTransport {
 
     private static key(address: string, port: number) {
         return `${address}:${port}`
+    }
+
+    getLocalAddress(): { address: string } {
+        return { address: "127.0.0.1" }
     }
 
     on(_event: "message", handler: MessageHandler): void {
