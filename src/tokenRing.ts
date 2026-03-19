@@ -10,6 +10,7 @@ import {
     TokenRingConfig,
     TokenRingWorkDistributorInterface,
     TokenRingRegistrationValue,
+    TokenRingTransport,
 } from "./tokenRingTypes"
 import { MVCCCore } from "@pebbletree/mvcc-testing"
 
@@ -67,7 +68,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
     protected issuer_version = 1
     last_seen_token: { token: Token, last_seen: number }
     protected token_timer: any = undefined
-    protected worker: Worker | null = null
+    protected transport: TokenRingTransport | null = null
     protected boundAddress: { address: string, port: number } = { address: "", port: 0 }
     protected averageLoopDuration = process.platform === "darwin" ? 2500 : 30000
     protected readonly server_reregister_time_ms
@@ -99,11 +100,19 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
         return this.last_seen_token.token
     }
 
+    /**
+     * Factory for the underlying transport (UDP socket worker).
+     * Override to substitute an in-memory transport for testing.
+     */
+    protected createTransport(): TokenRingTransport {
+        return new Worker(path.join(ProjectRoot, "dist", "src", "udpWorker.js")) as unknown as TokenRingTransport
+    }
+
     async Start() {
         try {
-            this.worker = new Worker(path.join(ProjectRoot, "dist", "src", "udpWorker.js"))
+            this.transport = this.createTransport()
             await this.Listen()
-            this.BindWorkerEvents()
+            this.BindTransportEvents()
             await this.Register()
             this.startLostTokenTimer()
             this.RunRegistrationForever()
@@ -122,21 +131,21 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 await new Promise<void>((R, E) => {
                     const onMsg = (msg: any) => {
                         if (msg.type === "bound") {
-                            this.worker!.removeListener("message", onMsg)
+                            this.transport!.removeListener("message", onMsg)
                             this.boundAddress = { address: msg.address, port: msg.port }
                             R()
                         } else if (msg.type === "bind-error") {
-                            this.worker!.removeListener("message", onMsg)
+                            this.transport!.removeListener("message", onMsg)
                             E({ code: msg.code, message: msg.message })
                         }
                     }
-                    this.worker!.on("message", onMsg)
-                    this.worker!.postMessage({ type: "bind", port: listenPort, address: localIP.address })
+                    this.transport!.on("message", onMsg)
+                    this.transport!.postMessage({ type: "bind", port: listenPort, address: localIP.address })
                 });
                 return
             } catch (e) {
                 if ((e as any)?.code !== "EADDRINUSE") throw e
-                this.worker!.postMessage({ type: "rebind" })
+                this.transport!.postMessage({ type: "rebind" })
                 listenPort++
             }
         }
@@ -154,11 +163,11 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 this.log.log("Destroying TokenRing")
                 this.onDestroy()
             }
-            if (this.worker) {
-                this.worker.removeAllListeners()
-                this.worker.postMessage({ type: "close" })
-                this.worker.terminate().catch(() => { })
-                this.worker = null
+            if (this.transport) {
+                this.transport.removeAllListeners()
+                this.transport.postMessage({ type: "close" })
+                this.transport.terminate().catch(() => { })
+                this.transport = null
             }
             if (this.token_timer) clearTimeout(this.token_timer);
             this.doTn(async txn => {
@@ -228,8 +237,8 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
         return Buffer.concat([this.tokenBuffer, tuple.pack([token.issued_by, token.issuer_version, token.averageWorkload, token.server_count, token.capabilities, token.flags])])
     }
     protected tokenBuffer = Buffer.alloc(1, this.prefixes.TOKEN)
-    protected BindWorkerEvents() {
-        this.worker!.on("message", async (msg: any) => {
+    protected BindTransportEvents() {
+        this.transport!.on("message", async (msg: any) => {
             try {
                 if (msg.type === "token") {
                     if (this.destroyed) return;
@@ -357,20 +366,20 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                     }
                     const isSelf = nextKey.server_ip === this.boundAddress.address && nextKey.server_port === this.boundAddress.port
                     const ackResult = await new Promise<"ok" | "timeout">((R) => {
-                        if (this.destroyed || !this.worker) { R("timeout"); return }
-                        const worker = this.worker
+                        if (this.destroyed || !this.transport) { R("timeout"); return }
+                        const transport = this.transport
                         const onMsg = (msg: any) => {
                             if (msg.type === "ack-ok") {
-                                worker.removeListener("message", onMsg)
+                                transport.removeListener("message", onMsg)
                                 R("ok")
                             } else if (msg.type === "ack-timeout") {
-                                worker.removeListener("message", onMsg)
+                                transport.removeListener("message", onMsg)
                                 R("timeout")
                             }
                         }
-                        worker.on("message", onMsg)
+                        transport.on("message", onMsg)
                         this.log.debug("sending to", nextKey.server_port, nextKey.server_ip)
-                        worker.postMessage({
+                        transport.postMessage({
                             type: "send",
                             data: this.serializeToken(new_token),
                             port: nextKey.server_port,

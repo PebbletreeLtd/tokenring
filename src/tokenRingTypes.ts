@@ -69,6 +69,21 @@ export interface TokenRingWorkDistributorInterface {
     Destroy(cause?: any): void
 }
 
+// ─── Transport ───────────────────────────────────────────────────────
+
+/**
+ * Abstraction over the UDP worker thread. The default implementation
+ * uses a real `worker_threads` Worker; swap in `InMemoryTransport`
+ * for fast, deterministic tests without real sockets.
+ */
+export interface TokenRingTransport {
+    on(event: "message", handler: (msg: any) => void): void
+    removeListener(event: "message", handler: (msg: any) => void): void
+    removeAllListeners(): void
+    postMessage(msg: any): void
+    terminate(): Promise<number>
+}
+
 // ─── Constructor options ─────────────────────────────────────────────
 
 export interface TokenRingOptions {

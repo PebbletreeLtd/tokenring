@@ -12,6 +12,7 @@ Key properties of the ring:
 - **Capability merging** — each server declares a capabilities bitmask. As the token travels the ring, capabilities are merged (bitwise OR) so every server learns the aggregate capabilities of the cluster.
 - **Failure detection** — if a server fails to ACK a forwarded token within the configured timeout, it is removed from the ring and the consumer is notified via `onServerUnresponsive` for cleanup (e.g. resetting orphaned jobs).
 - **Dedicated UDP worker thread** — the UDP socket runs in a separate `worker_threads` thread, so ACKs are sent and received immediately regardless of main-thread load. This prevents false evictions when the application's event loop is busy with `onToken` work or other processing.
+- **Pluggable transport** — the UDP worker is hidden behind a `TokenRingTransport` interface. Override `createTransport()` to swap in `InMemoryTransport` for fast, deterministic tests without real sockets.
 - **Lost-token recovery** — if no token arrives within an adaptive timeout, a new provisional token is issued automatically.
 - **Workload tracking** — each server reports its workload when releasing the token. An exponentially-weighted average is carried on the token for load-aware scheduling decisions.
 - **Value preservation** — re-registration uses read-modify-write, so any extra optional fields your storage backend adds to the registration value are preserved across heartbeats.
@@ -40,6 +41,7 @@ npm install @pebbletree/tokenring
 | `onError(e)` | Logs the error. Override for custom error handling. |
 | `onDestroy()` | Logs destruction. Override for graceful shutdown hooks. |
 | `getLocalAddress()` | Discovers the first non-internal IPv4 interface matching `/^e.*0$/` (eth0, en0, etc.). Override to control which interface/IP the ring binds to. |
+| `createTransport()` | Returns a real `worker_threads` Worker running the UDP socket. Override to return `InMemoryTransport` for testing. |
 
 ## Quick start
 
@@ -128,7 +130,36 @@ The ring's re-registration uses a read-modify-write pattern: it reads the existi
 npm test
 ```
 
-Tests use [vitest](https://vitest.dev/) and spin up real UDP sockets on localhost.
+Tests use [vitest](https://vitest.dev/) and run against both transport modes by default:
+
+- **memory** — uses `InMemoryTransport` (no real sockets, fast and deterministic)
+- **udp** — uses real UDP sockets on localhost via a `worker_threads` Worker
+
+To run only one mode:
+
+```bash
+TOKEN_RING_TRANSPORT=memory npm test
+TOKEN_RING_TRANSPORT=udp npm test
+```
+
+### In-memory transport
+
+`InMemoryTransport` is exported from the package and implements the same message protocol as the UDP worker thread, but routes messages through a shared in-process registry instead of real sockets. It is useful for upstream integration tests where spinning up real UDP sockets is unnecessary or undesirable.
+
+```ts
+import { InMemoryTransport, TokenRingWorkDistributor } from "@pebbletree/tokenring"
+
+class TestRing extends TokenRingWorkDistributor {
+  protected createTransport() { return new InMemoryTransport() }
+  getLocalAddress() { return { address: "127.0.0.1" } }
+
+  onToken({ done }) {
+    done({ running: 0 })
+  }
+}
+```
+
+Call `InMemoryTransport.clearRegistry()` between tests to avoid stale port bindings.
 
 ## License
 

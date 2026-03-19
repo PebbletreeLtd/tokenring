@@ -2,17 +2,18 @@
  * Token Ring Integration Tests
  * 
  * Tests for:
- * - Token ring formation with real UDP sockets
+ * - Token ring formation with real UDP sockets or in-memory transport
  * - Multi-server token passing
  * - Unresponsive server job reset
  * 
- * These tests spin up real TokenRingWorkDistributor instances with real
- * UDP sockets bound to localhost. They require FDB.
+ * By default both transports are tested. Set TOKEN_RING_TRANSPORT=memory
+ * or TOKEN_RING_TRANSPORT=udp to run only one mode.
  */
 console.log()
 import crypto from "crypto";
-import { test, expect } from "vitest";
+import { describe, test, expect, afterEach } from "vitest";
 import { Token, TokenFlags, TokenRingConfig, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
+import { InMemoryTransport } from "../src/inMemoryTransport";
 import { TestingTokenRingDistributor } from "./testingTokenRingDistributor";
 import { segmentSubspace, TestingStore } from "./store";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -20,6 +21,18 @@ const createGUID = () => {
     const id = crypto.randomBytes(16).toString("hex");
     return id;
 }
+
+type TransportMode = "udp" | "memory"
+
+const modes: TransportMode[] = process.env.TOKEN_RING_TRANSPORT
+    ? [process.env.TOKEN_RING_TRANSPORT as TransportMode]
+    : ["memory", "udp"]
+
+describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
+
+afterEach(() => {
+    if (transportMode === "memory") InMemoryTransport.clearRegistry()
+})
 
 /** Minimal token ring config suitable for fast testing */
 function testTokenRingConfig(overrides?: Partial<TokenRingConfig>): TokenRingConfig {
@@ -61,6 +74,7 @@ async function createTestTokenRing(options: {
             userHandler(ctx);
         },
         onServerUnresponsive: options.onServerUnresponsive,
+        createTransport: transportMode === "memory" ? () => new InMemoryTransport() : undefined,
     }).Start();
 
     return {
@@ -346,6 +360,7 @@ test("tokenRing: works with various issuer_id formats", async () => {
         issuer_id: uuidStyleId,
     }, {
         onToken: (ctx) => { ctx.done({ running: 0 }); },
+        createTransport: transportMode === "memory" ? () => new InMemoryTransport() : undefined,
     }).Start();
 
     try {
@@ -410,3 +425,5 @@ test("tokenRing: re-registration preserves extra optional members on the value",
         tr.Destroy();
     }
 });
+
+}) // describe.each
