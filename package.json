@@ -1,9 +1,9 @@
 {
   "name": "@pebbletree/tokenring",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Distributed token ring over UDP for coordinating work across a cluster of servers",
-  "main": "dist/src/index.js",
-  "types": "dist/src/index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "test": "tsc && vitest run",
