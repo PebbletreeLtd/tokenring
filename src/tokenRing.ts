@@ -11,8 +11,8 @@ import {
     TokenRingWorkDistributorInterface,
     TokenRingRegistrationValue,
     TokenRingTransport,
+    StorageTxn,
 } from "./tokenRingTypes"
-import { MVCCCore } from "@pebbletree/mvcc-testing"
 
 interface Logger {
     debug(...args: any[]): void
@@ -74,7 +74,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
     protected readonly server_reregister_time_ms
     protected destroyed: boolean = false
     readonly segmentName
-    readonly doTn;
+    readonly storage;
     readonly config: Readonly<TokenRingConfig>
     protected readonly log: Logger
     constructor(protected args: TokenRingOptions) {
@@ -94,7 +94,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 flags: TokenFlags.provisional
             }
         }
-        this.doTn = args.doTn
+        this.storage = args.storage
     }
     get Token() {
         return this.last_seen_token.token
@@ -170,13 +170,15 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 this.transport = null
             }
             if (this.token_timer) clearTimeout(this.token_timer);
-            this.doTn(async txn => {
-                return txn.clear({
-                    segment_name: this.args.segment_name,
-                    server_ip: this.boundAddress.address,
-                    server_port: this.boundAddress.port
+            this.storage
+                .doTn(async txn => {
+                    txn.tokenRingRegistration.clear({
+                        segment_name: this.args.segment_name,
+                        server_ip: this.boundAddress.address,
+                        server_port: this.boundAddress.port
+                    })
                 })
-            }).catch(e => this.log.error("Error during deregistration", e))
+                .catch(e => this.log.error("Error during deregistration", e))
         }
     }
     protected async Register() {
@@ -185,9 +187,9 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
             server_ip: this.boundAddress.address,
             server_port: this.boundAddress.port,
         }
-        await this.doTn(async txn => {
-            const existing = await txn.get(key)
-            txn.set(key, {
+        await this.storage.doTn(async txn => {
+            const existing = await txn.tokenRingRegistration.get(key)
+            txn.tokenRingRegistration.set(key, {
                 // Spread preserves optional members the consumer may have added.
                 // When existing is undefined (first write) the spread is a no-op;
                 // Is the storage adapter uses invariant types we know that any additional props are optional
@@ -285,7 +287,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
         })
     }
 
-    private async GetNextServerInRing(txn: MVCCCore.ITransaction<TokenRingRegistrationKey, TokenRingRegistrationKey, TokenRingRegistrationValue, TokenRingRegistrationValue>): Promise<TokenRingRegistrationKey | null> {
+    private async GetNextServerInRing(txn: StorageTxn<TokenRingRegistrationKey, TokenRingRegistrationValue>): Promise<TokenRingRegistrationKey | null> {
 
         const [record] = await txn.getRangeAll(
             {
@@ -304,7 +306,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
         );
         return record ? record[0] : null
     }
-    private async GetFirstServerInRing(txn: MVCCCore.ITransaction<TokenRingRegistrationKey, TokenRingRegistrationKey, TokenRingRegistrationValue, TokenRingRegistrationValue>): Promise<TokenRingRegistrationKey | null> {
+    private async GetFirstServerInRing(txn: StorageTxn<TokenRingRegistrationKey, TokenRingRegistrationValue>): Promise<TokenRingRegistrationKey | null> {
         const [record] = await txn.getRangeAll(
             {
                 segment_name: this.args.segment_name,
@@ -351,7 +353,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 this.log.error("Unhandled work handler error", e)
             }
             while (!this.destroyed) {
-                let nextKey = await this.doTn(async txn => await this.GetNextServerInRing(txn) || await this.GetFirstServerInRing(txn));
+                let nextKey = await this.storage.doTn(async txn => await this.GetNextServerInRing(txn.tokenRingRegistration) || await this.GetFirstServerInRing(txn.tokenRingRegistration));
                 if (!nextKey) {
                     throw new Error("No servers found in ring")
                 }
@@ -410,10 +412,10 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
         }
     }
     protected async MarkServerAsUnresponsive(key: TokenRingRegistrationKey) {
-        const value = await this.doTn(async txn => {
-            const value = await txn.get(key);
+        const value = await this.storage.doTn(async txn => {
+            const value = await txn.tokenRingRegistration.get(key);
             if (value) {
-                txn.clear(key)
+                txn.tokenRingRegistration.clear(key)
             }
             return value
 

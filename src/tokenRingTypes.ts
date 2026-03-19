@@ -8,7 +8,6 @@
  * Designed for eventual extraction into a standalone npm package.
  */
 
-import { TransactionFactory } from "@pebbletree/mvcc-testing/dist/types"
 
 // ─── Ring Registration ───────────────────────────────────────────────
 
@@ -53,9 +52,6 @@ export interface TokenRingConfig {
     verbose?: boolean
 }
 
-// ─── Callbacks ───────────────────────────────────────────────────────
-
-
 
 
 // ─── Public interface of the ring (exposed to onToken handler) ───────
@@ -92,11 +88,23 @@ export interface TokenRingTransport {
 }
 
 // ─── Constructor options ─────────────────────────────────────────────
+export interface StorageTxn<K, V> {
+    get: (key: K) => Promise<V | undefined>
+    set: (key: K, value: V) => void
+    clear: (key: K) => void
+    getRangeAll: (startKey: K, endKey: K, options?: { limit?: number; reverse?: boolean }) => Promise<Array<[K, V]>>
+}
+export interface TokenRingStorageAdapter {
+    doTn: <R>(callback: (txn: {
+        tokenRingRegistration: StorageTxn<TokenRingRegistrationKey, TokenRingRegistrationValue>
+    }) => Promise<R>) => Promise<R>,
+}
+
 
 export interface TokenRingOptions {
     segment_name: string
     capabilities: Buffer
     issuer_id: string,
     config: TokenRingConfig,
-    doTn: TransactionFactory<TokenRingRegistrationKey, TokenRingRegistrationValue>;
+    storage: TokenRingStorageAdapter
 }

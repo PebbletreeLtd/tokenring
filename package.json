@@ -1,6 +1,6 @@
 {
   "name": "@pebbletree/tokenring",
-  "version": "2.1.4",
+  "version": "2.1.5",
   "description": "Distributed token ring over UDP for coordinating work across a cluster of servers",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -26,11 +26,11 @@
     "url": "https://github.com/PebbletreeLtd/tokenring.git"
   },
   "dependencies": {
-    "@pebbletree/mvcc-testing": "~2.1.5",
     "@types/node": "~25.5.0",
     "fdb-tuple": "~1.0.0"
   },
   "devDependencies": {
+    "@pebbletree/mvcc-testing": "~2.1.5",
     "vitest": "~1.6.1",
     "typescript": "~5.9.3"
   }
