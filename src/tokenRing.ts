@@ -105,7 +105,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
      * Override to substitute an in-memory transport for testing.
      */
     protected createTransport(): TokenRingTransport {
-        return new Worker(path.join(ProjectRoot, "dist", "src", "udpWorker.js")) as unknown as TokenRingTransport
+        return new Worker(path.join(ProjectRoot, "dist", "udpWorker.js")) as unknown as TokenRingTransport
     }
 
     async Start() {
