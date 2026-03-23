@@ -25,7 +25,7 @@ npm install @pebbletree/tokenring
 
 ## Architecture
 
-`TokenRingWorkDistributor` is an abstract class. You subclass it to implement your token handler and optionally override lifecycle hooks. Storage is provided via a `TransactionFactory` passed in the constructor options — the base class owns the entire ring protocol including ring traversal, UDP transport, token serialisation, membership heartbeats, failure detection, and lost-token recovery.
+`TokenRingWorkDistributor` is an abstract class. You subclass it to implement your token handler and optionally override lifecycle hooks. Storage is provided via a `TokenRingStorageAdapter` passed in the constructor options — the adapter exposes a `doTn` method whose callback receives a `txn.tokenRingRegistration` object with `get`, `set`, `clear`, and `getRangeAll`. This lets you map the ring's storage needs onto any transactional backend (FoundationDB, an MVCC store, etc.) while keeping other subspaces on the same transaction. The base class owns the entire ring protocol including ring traversal, UDP transport, token serialisation, membership heartbeats, failure detection, and lost-token recovery.
 
 ### Abstract methods
 
@@ -61,7 +61,7 @@ class MyTokenRing extends TokenRingWorkDistributor {
   }
 }
 
-// 2. Create with your storage factory and start
+// 2. Create with your storage adapter and start
 const ring = await new MyTokenRing({
   segment_name: "my-segment",
   capabilities: Buffer.from([0x01]),
@@ -70,7 +70,16 @@ const ring = await new MyTokenRing({
     reregister_time_ms: 30_000,
     token_ack_timeout_ms: 1_000,
   },
-  doTn: myStore.doTransaction.bind(myStore),
+  storage: {
+    doTn: (callback) => myStore.doTransaction(txn => callback({
+      tokenRingRegistration: {
+        get: (key) => txn.at(registrationSubspace).get(key),
+        set: (key, value) => txn.at(registrationSubspace).set(key, value),
+        clear: (key) => txn.at(registrationSubspace).clear(key),
+        getRangeAll: (start, end, opts) => txn.at(registrationSubspace).getRangeAll(start, end, opts),
+      }
+    })),
+  },
 }).Start()
 
 // Graceful shutdown
@@ -85,7 +94,7 @@ ring.Destroy()
 | `capabilities` | yes | `Buffer` bitmask of capabilities this server provides |
 | `issuer_id` | yes | Unique identifier for this server |
 | `config` | yes | See [Configuration](#configuration) |
-| `doTn` | yes | A `TransactionFactory<TokenRingRegistrationKey, TokenRingRegistrationValue>` for transactional access to the membership table |
+| `storage` | yes | A `TokenRingStorageAdapter` — see [Storage adapter](#storage-adapter) below |
 
 ## Configuration
 
@@ -99,6 +108,27 @@ ring.Destroy()
 ## Capabilities
 
 Capabilities are a `Buffer` bitmask. Each bit position represents a capability your application defines. As the token circulates, every server's capabilities are OR'd together, so the token always reflects the full set of capabilities present in the ring.
+
+## Storage adapter
+
+The `storage` option accepts a `TokenRingStorageAdapter`:
+
+```ts
+interface TokenRingStorageAdapter {
+  doTn: <R>(callback: (txn: {
+    tokenRingRegistration: StorageTxn<TokenRingRegistrationKey, TokenRingRegistrationValue>
+  }) => Promise<R>) => Promise<R>
+}
+
+interface StorageTxn<K, V> {
+  get: (key: K) => Promise<V | undefined>
+  set: (key: K, value: V) => void
+  clear: (key: K) => void
+  getRangeAll: (startKey: K, endKey: K, options?: { limit?: number; reverse?: boolean }) => Promise<Array<[K, V]>>
+}
+```
+
+The `doTn` method wraps each call in a transaction. The callback receives a `txn` object with a `tokenRingRegistration` property — a simple key/value interface the ring uses for membership reads and writes. This design lets you map the ring onto a subspace of a larger transaction so that the ring's storage lives alongside your application's other data in the same transactional scope.
 
 ## API
 

@@ -1,6 +1,6 @@
 {
   "name": "@pebbletree/tokenring",
-  "version": "2.1.5",
+  "version": "2.1.6",
   "description": "Distributed token ring over UDP for coordinating work across a cluster of servers",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
