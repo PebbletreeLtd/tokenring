@@ -470,4 +470,51 @@ describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
         }
     });
 
+    // =========================================================================
+    // Multiple-token convergence
+    // =========================================================================
+
+    test("tokenRing: multiple tokens issued by different servers converge to one", async () => {
+        const segmentName = `test-converge-${createGUID().slice(0, 8)}`;
+        const capabilities = Buffer.from([testPayloadType]);
+        const config: Partial<TokenRingConfig> = { token_ack_timeout_ms: 1000 };
+
+        // Start 3 servers ~simultaneously so each issues its own provisional token
+        // before discovering the others.
+        const [r1, r2, r3] = await Promise.all([
+            createTestTokenRing({ segmentName, capabilities, config }),
+            createTestTokenRing({ segmentName, capabilities, config }),
+            createTestTokenRing({ segmentName, capabilities, config }),
+        ]);
+
+        try {
+            // Let the ring stabilise — each server should have circulated tokens
+            // long enough for the election logic to drop lower-priority tokens.
+            await waitFor(
+                () => r1.rounds() >= 3 && r2.rounds() >= 3 && r3.rounds() >= 3,
+                15000,
+                "waiting for all servers to complete 3+ rounds",
+            );
+
+            // The token with the lexicographically greatest issued_by wins.
+            const winningIssuer = [
+                r1.tr.issuer_id,
+                r2.tr.issuer_id,
+                r3.tr.issuer_id,
+            ].sort().pop()!;
+
+            // All three servers should now agree on the same token issuer.
+            expect(r1.tr.Token.issued_by).toBe(winningIssuer);
+            expect(r2.tr.Token.issued_by).toBe(winningIssuer);
+            expect(r3.tr.Token.issued_by).toBe(winningIssuer);
+
+            // The winning token should no longer be provisional (completed a full loop).
+            expect(r1.tr.Token.flags & TokenFlags.provisional).toBe(0);
+        } finally {
+            r1.tr.Destroy();
+            r2.tr.Destroy();
+            r3.tr.Destroy();
+        }
+    });
+
 }) // describe.each
