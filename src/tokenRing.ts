@@ -202,7 +202,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
     protected async RunRegistrationForever() {
         while (!this.destroyed) {
             try {
-                await new Promise(R => setTimeout(R, this.server_reregister_time_ms))
+                await new Promise(R => setTimeout(R, this.server_reregister_time_ms).unref())
                 await this.Register()
             } catch (e) {
                 this.Destroy(e)
@@ -270,7 +270,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                         let loopDuration = Date.now() - lastSeen
                         if (loopDuration < 500) {
                             //hold up tokens which are madly spinning round. Maybe I'm the only server
-                            await new Promise(R => setTimeout(R, 500 - loopDuration))
+                            await new Promise(R => setTimeout(R, 500 - loopDuration).unref())
                             loopDuration = Date.now() - lastSeen
                         }
                         const alpha = 0.1
@@ -359,7 +359,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 }
                 if (nextKey.server_ip === this.boundAddress.address && nextKey.server_port === this.boundAddress.port) {
                     //throttle if we are the only one at the party
-                    await new Promise(R => setTimeout(R, 100));
+                    await new Promise(R => setTimeout(R, 100).unref());
                 }
                 //pass the token on, if we still hold the same token
                 if (this.last_seen_token.token.issued_by === token.issued_by && this.last_seen_token.token.issuer_version === token.issuer_version) {
@@ -447,7 +447,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 capabilities: this.args.capabilities,
                 flags: TokenFlags.provisional
             }).catch(() => this.Destroy())
-        }, timeout)
+        }, timeout).unref()
     }
     abstract onToken(ctx: {
         ring: TokenRingWorkDistributorInterface

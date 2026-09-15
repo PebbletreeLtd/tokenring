@@ -92,7 +92,7 @@ parentPort!.on("message", (msg) => {
                 const timeout = setTimeout(() => {
                     pendingAckResolve = null
                     parentPort!.postMessage({ type: "ack-timeout" })
-                }, timeoutMs)
+                }, timeoutMs).unref()
 
                 pendingAckResolve = (rinfo) => {
                     if (rinfo.address === ip && rinfo.port === ackPort) {

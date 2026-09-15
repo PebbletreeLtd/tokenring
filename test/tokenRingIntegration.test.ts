@@ -16,7 +16,7 @@ import { Token, TokenFlags, TokenRingConfig, TokenRingWorkDistributorInterface }
 import { InMemoryTransport } from "../src/inMemoryTransport";
 import { TestingTokenRingDistributor } from "./testingTokenRingDistributor";
 import { segmentSubspace, TestingStore } from "./store";
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms).unref());
 const createGUID = () => {
     const id = crypto.randomBytes(16).toString("hex");
     return id;

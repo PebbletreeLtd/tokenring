@@ -52,7 +52,7 @@ export class InMemoryTransport implements TokenRingTransport {
         const snapshot = [...this.listeners]
         setTimeout(() => {
             for (const h of snapshot) h(msg)
-        }, 0)
+        }, 0).unref()
     }
 
     postMessage(msg: any): void {
@@ -105,7 +105,7 @@ export class InMemoryTransport implements TokenRingTransport {
                         if (awaitAck && !sender.closed) {
                             for (const h of [...sender.listeners]) h({ type: "ack-ok" })
                         }
-                    }, 0)
+                    }, 0).unref()
                 } else if (msg.awaitAck) {
                     const timeoutMs = msg.awaitAck.timeoutMs
                     const sender = this
@@ -113,7 +113,7 @@ export class InMemoryTransport implements TokenRingTransport {
                     setTimeout(() => {
                         if (sender.closed) return
                         for (const h of [...sender.listeners]) h({ type: "ack-timeout" })
-                    }, timeoutMs)
+                    }, timeoutMs).unref()
                 }
                 break
             }
