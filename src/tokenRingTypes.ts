@@ -107,4 +107,57 @@ export interface TokenRingOptions {
     issuer_id: string,
     config: TokenRingConfig,
     storage: TokenRingStorageAdapter
+    /**
+     * Optional freeform debug logger. Called at every meaningful transition
+     * in the ring. Wire it to your log framework when you need to trace a
+     * production stall.
+     */
+    debugLog?: (...args: any[]) => void
+    /**
+     * Optional structured testing hook. Called with a well-known enum event
+     * and a details record at every observable ring transition. Prefer this
+     * over grepping `debugLog` output when writing assertions.
+     */
+    onTestingEvent?: TokenRingTestObserver
 }
+
+/**
+ * Stable enum of every observable ring transition. Add new members only —
+ * removing or renaming a member is a breaking change for downstream tests.
+ */
+export enum TokenRingTestEvent {
+    /** Transport delivered a "token" message to us (before any drop check). */
+    TransportTokenIn = "TransportTokenIn",
+    /** BindTransportEvents silently discarded a token whose (issued_by, version) is <= last_seen. */
+    TokenDroppedAsDuplicate = "TokenDroppedAsDuplicate",
+    /** BindTransportEvents saw a token strictly greater than last_seen (about to adopt). */
+    TokenAdopted = "TokenAdopted",
+    /** TokenReceived body started running (either from wire or self-issue). */
+    TokenReceivedEnter = "TokenReceivedEnter",
+    /** TokenReceived body completed. */
+    TokenReceivedExit = "TokenReceivedExit",
+    /** Pass-on while-loop broke because last_seen was mutated (concurrent TokenReceived). */
+    PassOnSkippedStale = "PassOnSkippedStale",
+    /** Pass-on sent the token to the next server. */
+    PassOnSent = "PassOnSent",
+    /** Pass-on send returned "ok". */
+    PassOnAckOk = "PassOnAckOk",
+    /** Pass-on send returned "timeout" for a non-self target — triggers MarkServerAsUnresponsive. */
+    PassOnAckTimeout = "PassOnAckTimeout",
+    /** Lost-token timer scheduled. */
+    LostTokenTimerScheduled = "LostTokenTimerScheduled",
+    /** Lost-token timer fired — about to self-issue a token. */
+    LostTokenTimerFired = "LostTokenTimerFired",
+    /** Register() started. */
+    RegisterEnter = "RegisterEnter",
+    /** Register() committed. */
+    RegisterExit = "RegisterExit",
+    /** MarkServerAsUnresponsive removed a peer registration. */
+    ServerMarkedUnresponsive = "ServerMarkedUnresponsive",
+    /** Start() completed successfully. */
+    Started = "Started",
+    /** Destroy() invoked (may be with or without cause). */
+    Destroyed = "Destroyed",
+}
+
+export type TokenRingTestObserver = (event: TokenRingTestEvent, details: Record<string, unknown>) => void

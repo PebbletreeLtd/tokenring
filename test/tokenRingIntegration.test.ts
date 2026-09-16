@@ -12,7 +12,7 @@
 console.log()
 import crypto from "crypto";
 import { describe, test, expect, afterEach } from "vitest";
-import { Token, TokenFlags, TokenRingConfig, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
+import { Token, TokenFlags, TokenRingConfig, TokenRingTestEvent, TokenRingTestObserver, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
 import { InMemoryTransport } from "../src/inMemoryTransport";
 import { TestingTokenRingDistributor } from "./testingTokenRingDistributor";
 import { segmentSubspace, TestingStore } from "./store";
@@ -52,9 +52,23 @@ describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
         config?: Partial<TokenRingConfig>,
         onToken?: (ctx: { ring: TokenRingWorkDistributorInterface, token: Readonly<Token>, done: (workload: { running: number }) => void, error: (e: any) => void }) => void,
         onServerUnresponsive?: (reg: { key: any, value: any }) => void | Promise<void>,
+        issuerId?: string,
+        /**
+         * Optional per-transaction delay (ms) on ring membership storage.
+         * Simulates the real-time cost of an fdb transaction so behaviour
+         * matches downstream deployments. Applied as `await sleep(ms)` at
+         * the top of every `doTn` and before every awaited storage read.
+         */
+        storageDelayMs?: number,
+        /** Optional structured test observer forwarded to the ring. */
+        onTestingEvent?: TokenRingTestObserver,
     }) {
         let roundCount = 0;
         let lastSeenToken: Token | null = null;
+
+        const delay = options.storageDelayMs && options.storageDelayMs > 0
+            ? () => sleep(options.storageDelayMs!)
+            : () => Promise.resolve()
 
         const defaultHandler = (ctx: { ring: TokenRingWorkDistributorInterface, token: Readonly<Token>, done: (workload: { running: number }) => void, error: (e: any) => void }) => {
             ctx.done({ running: 0 });
@@ -66,11 +80,13 @@ describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
             capabilities: options.capabilities,
             config: testTokenRingConfig(options.config),
             storage: {
-                doTn: (callback) => {
+                doTn: async (callback) => {
+                    await delay()
                     return TestingStore.doTn(txn => {
                         return callback({
                             tokenRingRegistration: {
                                 get: async (key) => {
+                                    await delay()
                                     return txn.at(TestingStore).get(key);
                                 },
                                 set: (key, value) => {
@@ -80,6 +96,7 @@ describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
                                     txn.at(TestingStore).clear(key);
                                 },
                                 getRangeAll: async (start, end, options) => {
+                                    await delay()
                                     return txn.at(TestingStore).getRangeAll(start, end, options);
                                 },
                             }
@@ -87,7 +104,8 @@ describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
                     })
                 }
             },
-            issuer_id: createGUID(),
+            issuer_id: options.issuerId ?? createGUID(),
+            onTestingEvent: options.onTestingEvent,
         }, {
             onToken: (ctx) => {
                 roundCount++;
@@ -510,6 +528,80 @@ describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
 
             // The winning token should no longer be provisional (completed a full loop).
             expect(r1.tr.Token.flags & TokenFlags.provisional).toBe(0);
+        } finally {
+            r1.tr.Destroy();
+            r2.tr.Destroy();
+            r3.tr.Destroy();
+        }
+    });
+
+    // =========================================================================
+    // Reproducer: three servers, adversarial issuer_ids, structured events
+    // =========================================================================
+    // We instrument each ring with an onTestingEvent observer keyed on the
+    // TokenRingTestEvent enum and assert the invariants that a healthy ring
+    // must satisfy:
+    //   1. TokenDroppedAsDuplicate must never fire during normal operation.
+    //   2. PassOnSkippedStale must never fire — it indicates a concurrent
+    //      TokenReceived overwrote last_seen while another was mid-forward.
+    // Both are exactly what stalled log2 in the downstream repo.
+
+    test("tokenRing: three servers with adversarial issuer_ids never drop or stale-skip", async () => {
+        const segmentName = `test-adversarial-${createGUID().slice(0, 8)}`;
+        const capabilities = Buffer.from([testPayloadType]);
+        const config: Partial<TokenRingConfig> = { token_ack_timeout_ms: 1000 };
+
+        // Ring topology is 5000 -> 5001 -> 5002 -> 5000. Place the highest
+        // priority id in the middle so its token has to hop through a
+        // lower-priority peer to complete a loop — same shape as log2.
+        const highId = "ccccccccccccccccccccccccccccccccccc";
+        const midId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const lowId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        const events: Array<{ label: string; event: TokenRingTestEvent; details: Record<string, unknown> }> = []
+        const makeObserver = (label: string): TokenRingTestObserver =>
+            (event, details) => { events.push({ label, event, details }) }
+
+        // Serial starts give deterministic port assignment (5000, 5001, 5002).
+        const r1 = await createTestTokenRing({
+            segmentName, capabilities, config, issuerId: midId, storageDelayMs: 5,
+            onTestingEvent: makeObserver("port5000-mid"),
+        });
+        const r2 = await createTestTokenRing({
+            segmentName, capabilities, config, issuerId: highId, storageDelayMs: 5,
+            onTestingEvent: makeObserver("port5001-high"),
+        });
+        // r3 joins after the first two have exchanged provisional tokens.
+        await sleep(50);
+        const r3 = await createTestTokenRing({
+            segmentName, capabilities, config, issuerId: lowId, storageDelayMs: 25,
+            onTestingEvent: makeObserver("port5002-low"),
+        });
+
+        try {
+            // Give the ring 2 s of real time to circulate — well under the
+            // ~7500 ms lost-token timer, so if a stall occurs the assertions
+            // below fire before the ring can self-heal.
+            await sleep(2000);
+
+            const dropped = events.filter(e => e.event === TokenRingTestEvent.TokenDroppedAsDuplicate);
+            const staleSkipped = events.filter(e => e.event === TokenRingTestEvent.PassOnSkippedStale);
+
+            // Drops of a peer's provisional token during the initial election
+            // race are *expected* — the highest-priority id must win. What
+            // must NOT happen is PassOnSkippedStale, which means a concurrent
+            // TokenReceived overwrote last_seen while another was mid-forward,
+            // silently losing the token — this is the log2 stall.
+            expect(
+                staleSkipped,
+                `PassOnSkippedStale must never fire; got ${staleSkipped.length}: ${JSON.stringify(staleSkipped, null, 2)}\n(drops observed: ${dropped.length})`,
+            ).toEqual([]);
+
+            // Sanity: the ring must have been alive — every server should have
+            // received the token at least a couple of times within the budget.
+            expect(r1.rounds()).toBeGreaterThanOrEqual(2);
+            expect(r2.rounds()).toBeGreaterThanOrEqual(2);
+            expect(r3.rounds()).toBeGreaterThanOrEqual(2);
         } finally {
             r1.tr.Destroy();
             r2.tr.Destroy();

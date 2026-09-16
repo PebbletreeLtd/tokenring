@@ -11,9 +11,10 @@ import {
     TokenRingWorkDistributorInterface,
     TokenRingRegistrationValue,
     TokenRingTransport,
+    TokenRingTestEvent,
+    TokenRingTestObserver,
     StorageTxn,
 } from "./tokenRingTypes"
-
 interface Logger {
     debug(...args: any[]): void
     log(...args: any[]): void
@@ -29,6 +30,11 @@ function createLogger(verbose: boolean): Logger {
         warn: verbose ? console.warn.bind(console) : noop,
         error: console.error.bind(console),
     }
+}
+
+/** Signals a `waitForAToken` timeout — routed by the main loop into a self-issue path. */
+class TokenTimeout extends Error {
+    constructor() { super("TokenTimeout") }
 }
 
 /** Walk up from __dirname until we find a directory containing package.json */
@@ -67,7 +73,10 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
     readonly issuer_id;
     protected issuer_version = 1
     last_seen_token: { token: Token, last_seen: number }
-    protected token_timer: any = undefined
+    /** Single-slot ingress: highest-priority token seen but not yet processed. */
+    protected pendingToken: Token | undefined = undefined
+    /** Waiter registered by the main loop; woken by `enqueueToken` or the wait timeout. */
+    protected tokenWaiter: { resolve: (t: Token) => void; reject: (e: unknown) => void } | undefined = undefined
     protected transport: TokenRingTransport | null = null
     protected boundAddress: { address: string, port: number } = { address: "", port: 0 }
     protected averageLoopDuration = process.platform === "darwin" ? 2500 : 30000
@@ -77,9 +86,13 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
     readonly storage;
     readonly config: Readonly<TokenRingConfig>
     protected readonly log: Logger
+    debugLog: (...args: any[]) => void
+    protected readonly onTestingEvent: TokenRingTestObserver
     constructor(protected args: TokenRingOptions) {
         this.config = args.config
         this.log = createLogger(!!args.config.verbose)
+        this.debugLog = args.debugLog ?? noop
+        this.onTestingEvent = args.onTestingEvent ?? noop
         this.issuer_id = args.issuer_id
         this.server_reregister_time_ms = args.config.reregister_time_ms
         this.segmentName = args.segment_name
@@ -100,6 +113,12 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
         return this.last_seen_token.token
     }
 
+    /** Emit a structured test event and mirror to debugLog. */
+    protected notify(event: TokenRingTestEvent, details: Record<string, unknown> = {}): void {
+        this.debugLog(event, details)
+        try { this.onTestingEvent(event, details) } catch (e) { /* observer errors are never fatal */ }
+    }
+
     /**
      * Factory for the underlying transport (UDP socket worker).
      * Override to substitute an in-memory transport for testing.
@@ -114,13 +133,128 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
             await this.Listen()
             this.BindTransportEvents()
             await this.Register()
-            this.startLostTokenTimer()
             this.RunRegistrationForever()
+            void this.runMainLoop()
+            this.notify(TokenRingTestEvent.Started, {
+                issuer_id: this.issuer_id,
+                bound_ip: this.boundAddress.address,
+                bound_port: this.boundAddress.port,
+            })
         } catch (e) {
             this.log.error("WorkflowInstance.Start", e)
             throw e;
         }
         return this
+    }
+
+    /** Compare two tokens by ring priority. Returns >0, <0 or 0. */
+    protected compareTokens(a: Token, b: Token): number {
+        if (a.issued_by !== b.issued_by) return a.issued_by > b.issued_by ? 1 : -1
+        return a.issuer_version - b.issuer_version
+    }
+
+    /** Ingress from `BindTransportEvents`. Single-slot latch — highest survives. */
+    protected enqueueToken(incoming: Token) {
+        if (this.destroyed) return
+        if (this.compareTokens(incoming, this.last_seen_token.token) < 0) {
+            this.log.log("Dropping duplicate token", incoming.issued_by, incoming.issuer_version)
+            this.notify(TokenRingTestEvent.TokenDroppedAsDuplicate, {
+                issuer_id: this.issuer_id,
+                issued_by: incoming.issued_by,
+                issuer_version: incoming.issuer_version,
+                last_seen_by: this.last_seen_token.token.issued_by,
+                last_seen_version: this.last_seen_token.token.issuer_version,
+            })
+            return
+        }
+        if (this.pendingToken && this.compareTokens(incoming, this.pendingToken) < 0) return
+        this.pendingToken = incoming
+        const w = this.tokenWaiter
+        this.tokenWaiter = undefined
+        if (w) w.resolve(incoming)
+    }
+
+    /**
+     * Await either the next token on the ingress or a timeout. Called only
+     * from `runMainLoop` — never concurrently.
+     */
+    protected waitForAToken(timeoutMs: number): Promise<Token> {
+        if (this.pendingToken) {
+            const t = this.pendingToken
+            this.pendingToken = undefined
+            return Promise.resolve(t)
+        }
+        return new Promise<Token>((resolve, reject) => {
+            const wrapped = (t: Token) => { clearTimeout(timer); resolve(t) }
+            const timer = setTimeout(() => {
+                if (this.tokenWaiter?.resolve === wrapped) this.tokenWaiter = undefined
+                reject(new TokenTimeout())
+            }, timeoutMs).unref()
+            this.tokenWaiter = { resolve: wrapped, reject }
+        })
+    }
+
+    /**
+     * The ring's single serial main loop. Runs one token per iteration:
+     * either a peer token arrives on the ingress, or the wait times out and
+     * we self-issue. There is never more than one `processToken` in flight,
+     * so `last_seen_token` cannot be overwritten mid-forward.
+     */
+    protected async runMainLoop(): Promise<void> {
+        let firstWait = !!this.args.config.skipInitialTokenTimeout
+        while (!this.destroyed) {
+            const timeoutMs = firstWait
+                ? 0
+                : Math.max(this.averageLoopDuration * 3, 2000)
+            firstWait = false
+            this.notify(TokenRingTestEvent.LostTokenTimerScheduled, {
+                issuer_id: this.issuer_id,
+                timeout_ms: timeoutMs,
+            })
+
+            const prevLastSeen = this.last_seen_token.last_seen
+            let token: Token
+            try {
+                token = await this.waitForAToken(timeoutMs)
+            } catch (e) {
+                if (this.destroyed) break
+                if (!(e instanceof TokenTimeout)) { this.Destroy(e); break }
+                // Timeout — self-issue a fresh provisional token.
+                this.notify(TokenRingTestEvent.LostTokenTimerFired, {
+                    issuer_id: this.issuer_id,
+                    new_issuer_version: this.issuer_version + 1,
+                })
+                if (!this.args.config.skipInitialTokenTimeout)
+                    this.log.warn(`Token receive timeout ${this.segmentName}`)
+                token = {
+                    issued_by: this.issuer_id,
+                    server_count: 0,
+                    issuer_version: ++this.issuer_version,
+                    averageWorkload: this.last_seen_token.token.averageWorkload,
+                    capabilities: this.args.capabilities,
+                    flags: TokenFlags.provisional,
+                }
+            }
+
+            try {
+                await this.processToken(token)
+            } catch (e) {
+                this.Destroy(e)
+                break
+            }
+
+            // Loop throttle: keep the ring from mad-spinning when we are the
+            // only server. Uses the previous last_seen (before this iteration).
+            if (prevLastSeen !== 0 && !this.destroyed) {
+                let loopDuration = Date.now() - prevLastSeen
+                if (loopDuration < 500) {
+                    await new Promise(R => setTimeout(R, 500 - loopDuration).unref())
+                    loopDuration = Date.now() - prevLastSeen
+                }
+                const alpha = 0.1
+                this.averageLoopDuration = alpha * loopDuration + (1 - alpha) * this.averageLoopDuration
+            }
+        }
     }
 
     protected async Listen() {
@@ -155,6 +289,10 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
     Destroy(cause?: any) {
         if (!this.destroyed) {
             this.destroyed = true;
+            this.notify(TokenRingTestEvent.Destroyed, {
+                issuer_id: this.issuer_id,
+                cause: cause ? ((cause as any)?.message ?? String(cause)) : undefined,
+            })
             if (cause) {
                 this.log.error("Destroying TokenRing due to Error", cause)
                 this.onError(cause)
@@ -169,7 +307,10 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 this.transport.terminate().catch(() => { })
                 this.transport = null
             }
-            if (this.token_timer) clearTimeout(this.token_timer);
+            // Wake the main loop if it's parked on waitForAToken so it can exit.
+            const w = this.tokenWaiter
+            this.tokenWaiter = undefined
+            if (w) w.reject(new TokenTimeout())
             this.storage
                 .doTn(async txn => {
                     txn.tokenRingRegistration.clear({
@@ -187,6 +328,10 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
             server_ip: this.boundAddress.address,
             server_port: this.boundAddress.port,
         }
+        this.notify(TokenRingTestEvent.RegisterEnter, {
+            issuer_id: this.issuer_id,
+            key,
+        })
         await this.storage.doTn(async txn => {
             const existing = await txn.tokenRingRegistration.get(key)
             txn.tokenRingRegistration.set(key, {
@@ -197,6 +342,10 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 last_seen: Date.now(),
                 executor_id: this.issuer_id,
             })
+        })
+        this.notify(TokenRingTestEvent.RegisterExit, {
+            issuer_id: this.issuer_id,
+            key,
         })
     }
     protected async RunRegistrationForever() {
@@ -240,42 +389,24 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
     }
     protected tokenBuffer = Buffer.alloc(1, this.prefixes.TOKEN)
     protected BindTransportEvents() {
-        this.transport!.on("message", async (msg: any) => {
+        this.transport!.on("message", (msg: any) => {
             try {
                 if (msg.type === "token") {
                     if (this.destroyed) return;
                     const token: Token = this.deserializeToken(Buffer.from(msg.data))
-                    if (token.issued_by < this.last_seen_token.token.issued_by
-                        || (token.issued_by === this.last_seen_token.token.issued_by
-                            && token.issuer_version < this.last_seen_token.token.issuer_version)) {
-                        this.log.log("Dropping duplicate token", token.issued_by, token.issuer_version)
-                        return;
-                    }
-                    if (token.issued_by > this.last_seen_token.token.issued_by
-                        || (token.issued_by === this.last_seen_token.token.issued_by
-                            && token.issuer_version > this.last_seen_token.token.issuer_version)) {
-                        this.log.log("Adopting new token", token.issued_by, token.issuer_version)
-                    }
-
-                    const lastSeen = this.last_seen_token.last_seen
-                    try {
-                        if (token.issued_by === this.issuer_id)
-                            token.flags = token.flags & ~TokenFlags.provisional //if we issued the token, it's not provisional anymore
-                        await this.TokenReceived(token)
-                    } catch (e) {
-                        this.Destroy(e)
-                    }
-
-                    if (lastSeen !== 0) {
-                        let loopDuration = Date.now() - lastSeen
-                        if (loopDuration < 500) {
-                            //hold up tokens which are madly spinning round. Maybe I'm the only server
-                            await new Promise(R => setTimeout(R, 500 - loopDuration).unref())
-                            loopDuration = Date.now() - lastSeen
-                        }
-                        const alpha = 0.1
-                        this.averageLoopDuration = alpha * loopDuration + (1 - alpha) * this.averageLoopDuration
-                    }
+                    this.notify(TokenRingTestEvent.TransportTokenIn, {
+                        issuer_id: this.issuer_id,
+                        issued_by: token.issued_by,
+                        issuer_version: token.issuer_version,
+                        remoteAddress: msg.remoteAddress,
+                        remotePort: msg.remotePort,
+                        last_seen_by: this.last_seen_token.token.issued_by,
+                        last_seen_version: this.last_seen_token.token.issuer_version,
+                    })
+                    // Own token completed a loop — clear provisional before enqueueing.
+                    if (token.issued_by === this.issuer_id)
+                        token.flags = token.flags & ~TokenFlags.provisional
+                    this.enqueueToken(token)
                 } else if (msg.type === "error") {
                     this.Destroy(new Error(msg.message))
                 } else if (msg.type === "close") {
@@ -325,8 +456,34 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
         return record ? record[0] : null
     }
 
-    protected async TokenReceived(token: Token) {
+    /**
+     * Process a single token. Called exclusively from `runMainLoop`, so
+     * `last_seen_token` cannot be mutated by anyone else during its body.
+     * That guarantee is what removes the `PassOnSkippedStale` branch and
+     * the entire concurrent-`TokenReceived` race.
+     */
+    protected async processToken(token: Token) {
         if (this.destroyed) return;
+        const prev_seen_by = this.last_seen_token.token.issued_by
+        const prev_seen_version = this.last_seen_token.token.issuer_version
+        this.notify(TokenRingTestEvent.TokenReceivedEnter, {
+            issuer_id: this.issuer_id,
+            issued_by: token.issued_by,
+            issuer_version: token.issuer_version,
+            provisional: !!(token.flags & TokenFlags.provisional),
+            prev_seen_by,
+            prev_seen_version,
+        })
+        if (this.compareTokens(token, this.last_seen_token.token) > 0) {
+            this.log.log("Adopting new token", token.issued_by, token.issuer_version)
+            this.notify(TokenRingTestEvent.TokenAdopted, {
+                issuer_id: this.issuer_id,
+                issued_by: token.issued_by,
+                issuer_version: token.issuer_version,
+                prev_seen_by,
+                prev_seen_version,
+            })
+        }
         try {
             if (token.issuer_version !== this.last_seen_token.token.issuer_version) {
                 token.server_count++;
@@ -335,7 +492,6 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
             this.last_seen_token = { token, last_seen: Date.now() }
             //or my own capabilities into the token
             token.capabilities = mergeCapabilityBuffers(token.capabilities, this.args.capabilities)
-            this.startLostTokenTimer()
             //do some work
             try {
                 const workload = await new Promise<number>((R, E) => {
@@ -361,55 +517,73 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                     //throttle if we are the only one at the party
                     await new Promise(R => setTimeout(R, 100).unref());
                 }
-                //pass the token on, if we still hold the same token
-                if (this.last_seen_token.token.issued_by === token.issued_by && this.last_seen_token.token.issuer_version === token.issuer_version) {
-                    const new_token: Token = {
-                        ...this.last_seen_token.token,
-                    }
-                    const isSelf = nextKey.server_ip === this.boundAddress.address && nextKey.server_port === this.boundAddress.port
-                    const ackResult = await new Promise<"ok" | "timeout">((R) => {
-                        if (this.destroyed || !this.transport) { R("timeout"); return }
-                        const transport = this.transport
-                        const onMsg = (msg: any) => {
-                            if (msg.type === "ack-ok") {
-                                transport.removeListener("message", onMsg)
-                                R("ok")
-                            } else if (msg.type === "ack-timeout") {
-                                transport.removeListener("message", onMsg)
-                                R("timeout")
-                            }
+                const new_token: Token = {
+                    ...this.last_seen_token.token,
+                }
+                const isSelf = nextKey.server_ip === this.boundAddress.address && nextKey.server_port === this.boundAddress.port
+                this.notify(TokenRingTestEvent.PassOnSent, {
+                    issuer_id: this.issuer_id,
+                    issued_by: new_token.issued_by,
+                    issuer_version: new_token.issuer_version,
+                    target_ip: nextKey.server_ip,
+                    target_port: nextKey.server_port,
+                    isSelf,
+                })
+                const ackResult = await new Promise<"ok" | "timeout">((R) => {
+                    if (this.destroyed || !this.transport) { R("timeout"); return }
+                    const transport = this.transport
+                    const onMsg = (msg: any) => {
+                        if (msg.type === "ack-ok") {
+                            transport.removeListener("message", onMsg)
+                            R("ok")
+                        } else if (msg.type === "ack-timeout") {
+                            transport.removeListener("message", onMsg)
+                            R("timeout")
                         }
-                        transport.on("message", onMsg)
-                        this.log.debug("sending to", nextKey.server_port, nextKey.server_ip)
-                        transport.postMessage({
-                            type: "send",
-                            data: this.serializeToken(new_token),
-                            port: nextKey.server_port,
-                            address: nextKey.server_ip,
-                            awaitAck: {
-                                ip: nextKey.server_ip,
-                                port: nextKey.server_port,
-                                timeoutMs: this.args.config.token_ack_timeout_ms,
-                            }
-                        })
-                    })
-
-                    if (!this.destroyed && ackResult === "timeout" && !isSelf) {
-                        //our passed on token was never acked!!
-                        this.log.warn("Removing unresponsive server", nextKey)
-                        this.MarkServerAsUnresponsive(nextKey)
-                            .catch(e => this.log.error("Error marking server as unresponsive", e))
-                    } else {
-                        break
                     }
+                    transport.on("message", onMsg)
+                    this.log.debug("sending to", nextKey.server_port, nextKey.server_ip)
+                    transport.postMessage({
+                        type: "send",
+                        data: this.serializeToken(new_token),
+                        port: nextKey.server_port,
+                        address: nextKey.server_ip,
+                        awaitAck: {
+                            ip: nextKey.server_ip,
+                            port: nextKey.server_port,
+                            timeoutMs: this.args.config.token_ack_timeout_ms,
+                        }
+                    })
+                })
+
+                if (!this.destroyed && ackResult === "timeout" && !isSelf) {
+                    //our passed on token was never acked!!
+                    this.log.warn("Removing unresponsive server", nextKey)
+                    this.notify(TokenRingTestEvent.PassOnAckTimeout, {
+                        issuer_id: this.issuer_id,
+                        target_ip: nextKey.server_ip,
+                        target_port: nextKey.server_port,
+                    })
+                    this.MarkServerAsUnresponsive(nextKey)
+                        .catch(e => this.log.error("Error marking server as unresponsive", e))
                 } else {
-                    break;
+                    if (ackResult === "ok") this.notify(TokenRingTestEvent.PassOnAckOk, {
+                        issuer_id: this.issuer_id,
+                        target_ip: nextKey.server_ip,
+                        target_port: nextKey.server_port,
+                    })
+                    break
                 }
             }
         } catch (e) {
             this.log.error(e);
             throw e;
         }
+        this.notify(TokenRingTestEvent.TokenReceivedExit, {
+            issuer_id: this.issuer_id,
+            issued_by: token.issued_by,
+            issuer_version: token.issuer_version,
+        })
     }
     protected async MarkServerAsUnresponsive(key: TokenRingRegistrationKey) {
         const value = await this.storage.doTn(async txn => {
@@ -421,34 +595,16 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
 
         })
         if (!value) return; //already gone, maybe by another server that also noticed the issue
+        this.notify(TokenRingTestEvent.ServerMarkedUnresponsive, {
+            issuer_id: this.issuer_id,
+            dead_ip: key.server_ip,
+            dead_port: key.server_port,
+            dead_executor_id: value.executor_id,
+        })
         //notify the consumer to handle orphaned job cleanup
         await this.onServerUnresponsive({ key, value })
     }
 
-    protected _everLoaded = false;
-    protected startLostTokenTimer() {
-        if (this.token_timer) clearTimeout(this.token_timer)
-        if (this.destroyed) return
-        const timeout = this.args.config.skipInitialTokenTimeout && !this._everLoaded
-            ? 0
-            : Math.max(this.averageLoopDuration * 3, 2000)
-        this.log.debug("Waiting for", timeout, " before timing token out")
-        this.token_timer = setTimeout(() => {
-            if (this.destroyed) return
-            if (!this.args.config.skipInitialTokenTimeout || this._everLoaded)
-                this.log.warn(`Token receive timeout ${this.segmentName}`)
-            this._everLoaded = true;
-            //issue a new token, force it to be sent, even if the issued by isn't higher
-            this.TokenReceived({
-                issued_by: this.issuer_id,
-                server_count: 0,
-                issuer_version: ++this.issuer_version,
-                averageWorkload: this.last_seen_token.token.averageWorkload,
-                capabilities: this.args.capabilities,
-                flags: TokenFlags.provisional
-            }).catch(() => this.Destroy())
-        }, timeout).unref()
-    }
     abstract onToken(ctx: {
         ring: TokenRingWorkDistributorInterface
         token: Readonly<Token>
