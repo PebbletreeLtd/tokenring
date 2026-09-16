@@ -212,17 +212,22 @@ describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
         const segmentName = `test-two-${createGUID().slice(0, 8)}`;
         const config: Partial<TokenRingConfig> = { token_ack_timeout_ms: 1000 };
 
-        const { tr: tr1 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType]), config });
-        const { tr: tr2 } = await createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType2]), config });
+        // Start both concurrently so neither self-loops in isolation before
+        // discovering the other — the provisional flag alone is not a
+        // reliable signal that the ring has converged (a single node can
+        // clear its own provisional via a self-send).
+        const [{ tr: tr1 }, { tr: tr2 }] = await Promise.all([
+            createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType]), config }),
+            createTestTokenRing({ segmentName, capabilities: Buffer.from([testPayloadType2]), config }),
+        ]);
+        const bothCaps = testPayloadType | testPayloadType2;
 
         try {
-            // Wait until the token has completed a full loop (provisional flag cleared on both servers)
+            // Wait on the actual merge condition rather than a proxy.
             await waitFor(() =>
-                (tr1.Token.flags & TokenFlags.provisional) === 0 &&
-                (tr2.Token.flags & TokenFlags.provisional) === 0,
-                10000, "waiting for token to complete a full loop");
-
-            // Both should have both capabilities in their tokens after merging (bitwise OR)
+                ((tr1.Token.capabilities[0] ?? 0) & bothCaps) === bothCaps &&
+                ((tr2.Token.capabilities[0] ?? 0) & bothCaps) === bothCaps,
+                10000, "waiting for capabilities to merge across both servers");
             expect(tr1.Token.capabilities[0]! & testPayloadType).toBe(testPayloadType);
             expect(tr1.Token.capabilities[0]! & testPayloadType2).toBe(testPayloadType2);
             expect(tr2.Token.capabilities[0]! & testPayloadType).toBe(testPayloadType);
