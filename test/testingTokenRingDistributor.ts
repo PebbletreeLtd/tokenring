@@ -13,6 +13,12 @@ export class TestingTokenRingDistributor extends TokenRingWorkDistributor {
     onServerUnresponsive(registration: { key: TokenRingRegistrationKey; value: TokenRingRegistrationValue; }): void | Promise<void> {
         return this.options.onServerUnresponsive?.(registration);
     }
+    enqueueToken(token: Token): void {
+        super.enqueueToken(token)
+    }
+    waitForAToken(timeoutMs: number): Promise<Token> {
+        return super.waitForAToken(timeoutMs)
+    }
     protected createTransport(): TokenRingTransport {
         if (this.options.createTransport) return this.options.createTransport()
         return super.createTransport()

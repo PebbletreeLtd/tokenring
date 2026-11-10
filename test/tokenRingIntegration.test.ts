@@ -11,7 +11,7 @@
  */
 console.log()
 import crypto from "crypto";
-import { describe, test, expect, afterEach } from "vitest";
+import { describe, test, expect, afterEach, vi } from "vitest";
 import { Token, TokenFlags, TokenRingConfig, TokenRingTestEvent, TokenRingTestObserver, TokenRingWorkDistributorInterface } from "../src/tokenRingTypes";
 import { InMemoryTransport } from "../src/inMemoryTransport";
 import { TestingTokenRingDistributor } from "./testingTokenRingDistributor";
@@ -27,6 +27,48 @@ type TransportMode = "udp" | "memory"
 const modes: TransportMode[] = process.env.TOKEN_RING_TRANSPORT
     ? [process.env.TOKEN_RING_TRANSPORT as TransportMode]
     : ["memory", "udp"]
+
+describe("tokenRing (token handling)", () => {
+    afterEach(() => {
+        vi.useRealTimers()
+    })
+
+    test("tokenRing: server receives each token arrival only once", async () => {
+        vi.useFakeTimers()
+        const ring = new TestingTokenRingDistributor({
+            issuer_id: "receiver",
+            segment_name: "ingress",
+            capabilities: Buffer.alloc(0),
+            config: { reregister_time_ms: 60000, token_ack_timeout_ms: 500 },
+            storage: { doTn: async () => { throw new Error("Unexpected storage access") } },
+        }, { onToken: ctx => ctx.done({ running: 0 }) })
+        const token: Token = {
+            issued_by: "sender",
+            issuer_version: 1,
+            averageWorkload: 0,
+            server_count: 0,
+            capabilities: Buffer.alloc(0),
+            flags: TokenFlags.provisional,
+        }
+
+        const first = ring.waitForAToken(1000)
+        ring.enqueueToken(token)
+        expect(await first).toBe(token)
+
+        let deliveredAgain = false
+        const second = ring.waitForAToken(1000).then(received => {
+            deliveredAgain = true
+            return received
+        })
+        await vi.advanceTimersByTimeAsync(1)
+        expect(deliveredAgain).toBe(false)
+
+        const nextToken = { ...token, issuer_version: 2 }
+        ring.enqueueToken(nextToken)
+        expect(await second).toBe(nextToken)
+        expect(vi.getTimerCount()).toBe(0)
+    })
+})
 
 describe.each(modes)("tokenRing (%s transport)", (transportMode) => {
 

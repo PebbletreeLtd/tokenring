@@ -168,10 +168,13 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
             return
         }
         if (this.pendingToken && this.compareTokens(incoming, this.pendingToken) < 0) return
-        this.pendingToken = incoming
-        const w = this.tokenWaiter
-        this.tokenWaiter = undefined
-        if (w) w.resolve(incoming)
+        if (this.tokenWaiter) {
+            const waiter = this.tokenWaiter
+            this.tokenWaiter = undefined
+            waiter.resolve(incoming)
+        } else {
+            this.pendingToken = incoming
+        }
     }
 
     /**
@@ -190,7 +193,10 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
                 if (this.tokenWaiter?.resolve === wrapped) this.tokenWaiter = undefined
                 reject(new TokenTimeout())
             }, timeoutMs).unref()
-            this.tokenWaiter = { resolve: wrapped, reject }
+            this.tokenWaiter = {
+                resolve: wrapped,
+                reject: error => { clearTimeout(timer); reject(error) },
+            }
         })
     }
 
@@ -352,6 +358,7 @@ export abstract class TokenRingWorkDistributor implements TokenRingWorkDistribut
         while (!this.destroyed) {
             try {
                 await new Promise(R => setTimeout(R, this.server_reregister_time_ms).unref())
+                if (this.destroyed) return
                 await this.Register()
             } catch (e) {
                 this.Destroy(e)
